@@ -39,6 +39,7 @@ NODE_MAJOR="${NODE_MAJOR:-22}"          # minimum acceptable Node major
 PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | vim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
+CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
 SKIP_SYSTEM="${SKIP_SYSTEM:-0}"
@@ -47,6 +48,7 @@ SKIP_PYTHON="${SKIP_PYTHON:-0}"
 SKIP_MSSQL="${SKIP_MSSQL:-0}"
 SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
+SKIP_CLAUDE_CONF="${SKIP_CLAUDE_CONF:-0}"
 SKIP_TMUX_CONF="${SKIP_TMUX_CONF:-0}"
 SKIP_SHELL_CONF="${SKIP_SHELL_CONF:-0}"
 SKIP_EDITOR_CONF="${SKIP_EDITOR_CONF:-0}"
@@ -398,6 +400,123 @@ if [[ "$SKIP_CLAUDE" != "1" ]]; then
     log "Installing Claude Code (native installer, per-user, auto-updating)"
     soft "claude-code" bash -c 'curl -fsSL --max-time 120 https://claude.ai/install.sh | bash' || true
   fi
+fi
+
+# ======================================================== claude code conf ==
+# Two files, two very different policies:
+#
+#   ~/.claude/statusline.sh    fully ours — regenerated on every run
+#   ~/.claude/settings.json    yours — this only fills in keys that are NOT
+#                              already there
+#
+# settings.json is a file you also edit from inside a session (/config,
+# /statusline, /doctor), so a re-run must never undo a choice you made there.
+# Delete a key and re-run to get our default back. MCP servers are deliberately
+# left alone: configure those by hand.
+if [[ "$SKIP_CLAUDE_CONF" != "1" ]] && have claude; then
+  log "Configuring Claude Code"
+  mkdir -p "$HOME/.claude"
+
+  # ---- status line ---------------------------------------------------------
+  # Catppuccin Mocha, to match tmux/bat/delta/fzf. The session JSON arrives on
+  # stdin; every field is optional, so each one is guarded.
+  cat > "$HOME/.claude/statusline.sh" <<'STATUSLINE'
+#!/usr/bin/env bash
+# ~/.claude/statusline.sh — managed by dev-bootstrap.sh, regenerated on re-run.
+# Renders: Opus · project · branch* · 38% ctx · $0.42
+IFS= read -r -d '' IN || true
+j() { printf '%s' "$IN" | jq -r "$1 // empty" 2>/dev/null; }
+
+mauve=$'\033[38;2;203;166;247m'; blue=$'\033[38;2;137;180;250m'
+green=$'\033[38;2;166;227;161m'; peach=$'\033[38;2;250;179;135m'
+red=$'\033[38;2;243;139;168m';   grey=$'\033[38;2;108;112;134m'
+text=$'\033[38;2;205;214;244m';  off=$'\033[0m'
+
+cwd="$(j '.workspace.current_dir')"
+model="$(j '.model.display_name')"
+dir="$(basename "${cwd:-$PWD}")"
+pct="$(j '.context_window.used_percentage')"; pct="${pct%%.*}"; pct="${pct:-0}"
+cost="$(j '.cost.total_cost_usd')"
+style="$(j '.output_style.name')"
+
+branch="$(git -C "${cwd:-$PWD}" branch --show-current 2>/dev/null)"
+if [[ -n "$branch" ]]; then
+  git -C "${cwd:-$PWD}" diff --quiet --ignore-submodules HEAD 2>/dev/null || branch+="*"
+fi
+
+if   (( pct < 50 )); then pc="$green"
+elif (( pct < 80 )); then pc="$peach"
+else                      pc="$red"; fi
+
+out="${mauve}${model}${off}"
+out+=" ${grey}·${off} ${blue}${dir}${off}"
+[[ -n "$branch" ]] && out+=" ${grey}·${off} ${green}${branch}${off}"
+out+=" ${grey}·${off} ${pc}${pct}% ctx${off}"
+[[ -n "$cost"   ]] && out+=" ${grey}·${off} ${text}$(printf '$%.2f' "$cost")${off}"
+[[ -n "$style" && "$style" != "default" ]] && out+=" ${grey}·${off} ${text}${style}${off}"
+printf '%s' "$out"
+STATUSLINE
+  chmod +x "$HOME/.claude/statusline.sh"
+  sub "wrote ~/.claude/statusline.sh (Catppuccin Mocha)"
+
+  # ---- settings ------------------------------------------------------------
+  # `$def * .` deep-merges with the RIGHT side winning, so everything already in
+  # the file — your hooks, tui, MCP entries, any theme you picked — survives.
+  if have jq; then
+    cc_set="$HOME/.claude/settings.json"
+    [[ -s "$cc_set" ]] || printf '{}\n' > "$cc_set"
+    cc_def='{
+      "theme": "dark",
+      "statusLine": { "type": "command", "command": "~/.claude/statusline.sh", "padding": 0 },
+      "alwaysThinkingEnabled": true,
+      "autoUpdatesChannel": "stable",
+      "cleanupPeriodDays": 90,
+      "includeCoAuthoredBy": false
+    }'
+    cc_tmp="$(mktemp)"
+    if jq --argjson def "$cc_def" '$def * .' "$cc_set" > "$cc_tmp" 2>/dev/null && [[ -s "$cc_tmp" ]]; then
+      # Compared by content, not by bytes: Claude Code writes this file with its
+      # own formatting, and jq's differs — a byte comparison would "change" it on
+      # every single run.
+      if [[ "$(jq -S . "$cc_tmp")" == "$(jq -S . "$cc_set")" ]]; then
+        sub "settings.json already has every key we would seed"
+      else
+        cp -p "$cc_set" "${cc_set}.bak"
+        cat "$cc_tmp" > "$cc_set"          # keeps the original mode and inode
+        sub "seeded the missing keys in ~/.claude/settings.json (old file: settings.json.bak)"
+      fi
+    else
+      warn "the Claude Code settings file is not valid JSON — leaving it untouched"
+      note_fail "claude settings.json"
+    fi
+    rm -f "$cc_tmp"
+  else
+    warn "jq is missing — skipping the settings.json merge"
+  fi
+
+  # ---- plugins -------------------------------------------------------------
+  # Language servers, so Claude can resolve definitions and read diagnostics
+  # instead of grepping for them.
+  #
+  # The marketplace has to be added before anything can be installed from it: a
+  # fresh ~/.claude knows no marketplaces at all, and `plugin install` then fails
+  # with "not found in marketplace". Adding it records the source in
+  # settings.json (extraKnownMarketplaces) and clones it, so this is a one-off
+  # per machine — repeating it is harmless but slow, hence the check.
+  if ! claude plugin marketplace list 2>/dev/null | grep -qF claude-plugins-official; then
+    sub "adding the claude-plugins-official marketplace"
+    timeout 180 claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 \
+      || warn "could not add the plugin marketplace"
+  fi
+  for cc_plug in $CLAUDE_PLUGINS; do
+    if claude plugin list 2>/dev/null | grep -qF "$cc_plug"; then
+      sub "plugin ${cc_plug} already installed"
+    else
+      sub "installing plugin ${cc_plug}"
+      timeout 180 claude plugin install "${cc_plug}@claude-plugins-official" >/dev/null 2>&1 \
+        || { warn "could not install the ${cc_plug} plugin"; note_fail "plugin:${cc_plug}"; }
+    fi
+  done
 fi
 
 # ============================================================== tmux.conf ===

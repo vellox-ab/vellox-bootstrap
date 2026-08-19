@@ -48,11 +48,12 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `vim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
+| `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp` | Plugins to install from `claude-plugins-official` |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
 `SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
 `SKIP_EDITOR_CONF`, `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
-`SKIP_INPUTRC` — set any of them to `1`.
+`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC` — set any of them to `1`.
 
 ### Git identity
 
@@ -90,7 +91,18 @@ identity is still unset at the end.
 - **Node.js** — from NodeSource when the distro version is older than
   `NODE_MAJOR`.
 - **Python** — `python3` with `venv`/`pip`/`dev`, `pipx`, and `uv`.
-- **Claude Code** — installed to `~/.local/bin/claude` (alias `cc`).
+- **Claude Code** — installed to `~/.local/bin/claude` (alias `cc`), plus:
+  - `~/.claude/statusline.sh`, a Catppuccin Mocha status line showing model,
+    directory, git branch, context use and session cost. Fully managed —
+    rewritten on every run.
+  - defaults seeded into `~/.claude/settings.json`: `theme`, the status line,
+    `alwaysThinkingEnabled`, `autoUpdatesChannel: stable`,
+    `cleanupPeriodDays: 90`, `includeCoAuthoredBy: false`. Only keys that are
+    **missing** are added, so anything you set with `/config` survives a re-run,
+    and MCP servers are never touched — configure those by hand.
+  - the `claude-plugins-official` marketplace, and the language-server plugins
+    in `CLAUDE_PLUGINS` (Pyright and TypeScript by default), which give Claude
+    real definitions and diagnostics instead of grep.
 - **tmux** — a full `tmux.conf` with Catppuccin Mocha, vi copy mode, sane splits
   and navigation.
 - **Shell** — `~/.config/dev-bootstrap/rc.sh` with PATH, truecolor, a shared-dev
@@ -130,4 +142,4 @@ it installed, and lists anything that did not complete.
 
 ## Version
 
-Current version: **5.2.0** (see `VERSION`).
+Current version: **5.3.0** (see `VERSION`).
