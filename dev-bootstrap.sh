@@ -20,6 +20,12 @@
 #   SKIP_MSSQL=1 bash dev-bootstrap.sh     # skip a section
 #   DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 #
+# The global git identity (user.name / user.email) is asked for interactively
+# near the start of the run. To answer it up front instead:
+#
+#   GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap.sh
+#   SKIP_GIT_IDENTITY=1 bash dev-bootstrap.sh    # never ask, leave git alone
+#
 # Deliberately NOT using `set -e`: a single failing repo must never leave the
 # machine half-configured. Failures are collected and reported at the end.
 #
@@ -46,6 +52,7 @@ SKIP_SHELL_CONF="${SKIP_SHELL_CONF:-0}"
 SKIP_EDITOR_CONF="${SKIP_EDITOR_CONF:-0}"
 SKIP_SYSCTL="${SKIP_SYSCTL:-0}"
 SKIP_GIT_CONF="${SKIP_GIT_CONF:-0}"
+SKIP_GIT_IDENTITY="${SKIP_GIT_IDENTITY:-0}"
 SKIP_INPUTRC="${SKIP_INPUTRC:-0}"
 CLEAN_ONLY=0
 
@@ -126,6 +133,62 @@ trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null || true' EXIT
 
 mkdir -p "$CONF_DIR" "$HOME/.local/bin"
 
+# ------------------------------------------------------------ git identity --
+# Asked here rather than down in the git section: the package installs in
+# between take several minutes, and a prompt that only shows up after them is
+# missed by anyone who walked away from the machine.
+#
+# Precedence: GIT_USER_NAME / GIT_USER_EMAIL from the environment win outright
+# (and suppress the prompt entirely, so an unattended run never blocks), then
+# whatever git already has globally — offered as the default you can accept
+# with Enter — then what is typed here.
+#
+# Reading from /dev/tty rather than stdin keeps this working when the script is
+# piped into bash (curl ... | bash). With no controlling terminal there is
+# nothing to read from, so the prompt is skipped and the git section warns.
+ask_tty() {                    # ask_tty <varname> <question> <default>
+  local __name="$1" question="$2" default="$3" reply=""
+  if [[ -n "$default" ]]; then
+    printf '    %-14s [%s]: ' "$question" "$default" >/dev/tty
+  else
+    printf '    %-14s ' "$question:" >/dev/tty
+  fi
+  IFS= read -r reply </dev/tty || reply=""
+  reply="${reply#"${reply%%[![:space:]]*}"}"    # trim leading whitespace
+  reply="${reply%"${reply##*[![:space:]]}"}"    # trim trailing whitespace
+  [[ -z "$reply" ]] && reply="$default"
+  printf -v "$__name" '%s' "$reply"
+}
+
+GIT_IDENT_FROM_ENV=0
+[[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]] && GIT_IDENT_FROM_ENV=1
+
+if [[ "$SKIP_GIT_CONF" != "1" && "$SKIP_GIT_IDENTITY" != "1" && "$GIT_IDENT_FROM_ENV" != "1" ]]; then
+  # git may not be installed yet on a fresh box; an empty default is fine.
+  if have git; then
+    [[ -z "$GIT_USER_NAME"  ]] && GIT_USER_NAME="$(git config --global user.name  2>/dev/null || true)"
+    [[ -z "$GIT_USER_EMAIL" ]] && GIT_USER_EMAIL="$(git config --global user.email 2>/dev/null || true)"
+  fi
+  if (exec </dev/tty) 2>/dev/null; then
+    log "Git identity"
+    sub "stamped on every commit you make on this machine (git config --global)"
+    while :; do
+      ask_tty GIT_USER_NAME "Full name" "$GIT_USER_NAME"
+      [[ -n "$GIT_USER_NAME" ]] && break
+      warn "a name is required — or re-run with SKIP_GIT_IDENTITY=1 to skip this"
+    done
+    # The default stays the value we started with: a rejected answer must never
+    # come back as something Enter would accept.
+    git_email_default="$GIT_USER_EMAIL"
+    while :; do
+      ask_tty GIT_USER_EMAIL "Email" "$git_email_default"
+      [[ "$GIT_USER_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] && break
+      warn "that does not look like an email address"
+    done
+    sub "commits will be authored as: ${GIT_USER_NAME} <${GIT_USER_EMAIL}>"
+  fi
+fi
+
 # =============================================================== cleanup ====
 # Remove every apt artifact this script family has ever created, in any format,
 # from any release. They are all regenerated below for the release we are on.
@@ -139,6 +202,7 @@ LEGACY_SOURCES=(
   /etc/apt/sources.list.d/nodesource.sources
   /etc/apt/sources.list.d/pgdg.list
   /etc/apt/sources.list.d/pgdg.sources
+  /etc/apt/preferences.d/mssql-release.pref
 )
 LEGACY_KEYS=(
   /etc/apt/keyrings/microsoft-prod.gpg
@@ -156,7 +220,7 @@ done
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   sudo rm -f "$f"; sub "removed  $f"; removed=$((removed+1))
-done < <(grep -rls "managed-by: dev-bootstrap" /etc/apt/sources.list.d/ 2>/dev/null)
+done < <(grep -rls "managed-by: dev-bootstrap" /etc/apt/sources.list.d/ /etc/apt/preferences.d/ 2>/dev/null)
 (( removed == 0 )) && sub "nothing to clean"
 
 log "Third-party apt sources NOT managed by this script (left untouched)"
@@ -1310,10 +1374,17 @@ else
   [[ "$(git config --global interactive.diffFilter)" == delta* ]] && \
     git config --global --unset interactive.diffFilter
 fi
-[[ -n "$GIT_USER_NAME"  ]] && git config --global user.name  "$GIT_USER_NAME"
-[[ -n "$GIT_USER_EMAIL" ]] && git config --global user.email "$GIT_USER_EMAIL"
+# Identity, as collected at the top of the run (env > prompt > what git had).
+if [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]]; then
+  git config --global user.name  "$GIT_USER_NAME"
+  git config --global user.email "$GIT_USER_EMAIL"
+  sub "identity: ${GIT_USER_NAME} <${GIT_USER_EMAIL}>"
+else
+  [[ -n "$GIT_USER_NAME"  ]] && git config --global user.name  "$GIT_USER_NAME"
+  [[ -n "$GIT_USER_EMAIL" ]] && git config --global user.email "$GIT_USER_EMAIL"
+fi
 if ! git config --global user.email >/dev/null; then
-  warn "git identity not set — run:"
+  warn "git identity not set — re-run on a terminal to be asked for it, or set it by hand:"
   warn "  git config --global user.name 'Your Name'"
   warn "  git config --global user.email 'you@example.com'"
 fi
@@ -1339,75 +1410,226 @@ git config --global core.excludesfile "$HOME/.gitignore_global"
 fi
 
 # ================================================== microsoft sql tooling ===
-# Release reality as of this writing:
-#   ubuntu/24.04/prod (noble)     -> has msodbcsql18 + mssql-tools18
-#   ubuntu/25.10/prod (questing)  -> has both
-#   ubuntu/26.04/prod (resolute)  -> repo exists and signs, but is EMPTY
-# So on 26.04 we deliberately use the noble packages; they run fine.
+# What the Microsoft repos actually carry is probed live below; as of this
+# writing:
+#   ubuntu/24.04/prod (noble)     -> msodbcsql18 + mssql-tools18, plus ~100
+#                                    unrelated packages (powershell, moby, ...)
+#   ubuntu/25.10/prod (questing)  -> msodbcsql18 + mssql-tools18 and nothing else
+#   ubuntu/26.04/prod (resolute)  -> exists and signs, but carries only the
+#                                    container/Azure packages — no SQL tooling
+# So on 26.04 we install packages built for an older release. They run fine:
+# both depend on nothing but libc6, libstdc++6, libkrb5-3, openssl and debconf.
+#
+# Three routes are tried in order, because the repo route has many moving parts
+# (keys, suites, Signed-By conflicts, pinning) and any of them can already be
+# broken on a machine that has met another Microsoft installer:
+#   1. a Microsoft repo that is already configured here and already offers it
+#   2. our own source for the newest suite that really carries the packages
+#   3. the .deb files straight from the pool, checksum-verified and installed
+#      with `apt-get install ./file.deb`, so apt still resolves dependencies
+#      but nothing depends on repo metadata, signing keys or pinning
+# If all three fail, go-sqlcmd (a static binary: sqlcmd, but no bcp, no driver).
+MS_BIN=/opt/mssql-tools18/bin
+
+# Both packages gate their *preinst* on a debconf answer, and a preinst that
+# refuses aborts the whole apt transaction. ACCEPT_EULA in the environment is
+# Microsoft's documented way in, but it only reaches the maintainer script if
+# sudo passes it through — which is why every install below goes through
+# `sudo env`. Seeding the answers as well covers the case where the config
+# script never runs (a plain `dpkg -i`, or a package configured out of band).
+ms_eula_preseed() {
+  have debconf-set-selections || return 0
+  printf '%s\n' \
+    'msodbcsql18 msodbcsql/ACCEPT_EULA boolean true' \
+    'msodbcsql18 msodbcsql/accept_eula boolean true' \
+    'mssql-tools18 mssql-tools/accept_eula boolean true' \
+    | sudo debconf-set-selections 2>/dev/null
+}
+
+# ms_apt_install <target...> — targets are package names or local .deb paths.
+# Only mssql-tools18 is ever named: msodbcsql18 comes along as its dependency
+# when it is missing and is left alone when it is already installed. Asking for
+# msodbcsql18 by name would make apt reinstall it, and its preinst aborts the
+# transaction with "ODBC Driver 18 for SQL Server detected!" when the driver is
+# already registered with odbcinst.
+ms_apt_install() {
+  sudo env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -qq "$@"
+}
+
+# ms_newest <packages-index> <package> -> "version<TAB>filename<TAB>sha256"
+# The pool indexes keep every version ever published, in no useful order, so
+# the winner is picked with dpkg's own version comparison rather than sort.
+ms_newest() {
+  local idx="$1" want="$2" best="" bestline="" v f s
+  while IFS=$'\t' read -r v f s; do
+    [[ -z "$v" || -z "$f" || -z "$s" ]] && continue
+    if [[ -z "$best" ]] || dpkg --compare-versions "$v" gt "$best"; then
+      best="$v"; bestline="${v}"$'\t'"${f}"$'\t'"${s}"
+    fi
+  done < <(awk -v want="$want" '
+      function flush() {
+        if (p == want && v != "" && f != "" && s != "") print v "\t" f "\t" s
+        p=""; v=""; f=""; s=""
+      }
+      /^Package: /  { flush(); p=$2 }
+      /^Version: /  { if (p==want) v=$2 }
+      /^Filename: / { if (p==want) f=$2 }
+      /^SHA256: /   { if (p==want) s=$2 }
+      END           { flush() }
+    ' "$idx")
+  [[ -n "$bestline" ]] || return 1
+  printf '%s\n' "$bestline"
+}
+
+# ms_pool_install <base-url> <packages-index>
+ms_pool_install() {
+  local base="$1" idx="$2" tmpd pkg line ver file sha rc=0
+  tmpd="$(mktemp -d)" || return 1
+  local debs=()
+  for pkg in msodbcsql18 mssql-tools18; do
+    # Skip the driver when it is already installed — see ms_apt_install.
+    [[ "$pkg" == msodbcsql18 ]] && dpkg -s msodbcsql18 >/dev/null 2>&1 && continue
+    if ! line="$(ms_newest "$idx" "$pkg")"; then
+      warn "${pkg} is not in the pool index"; rc=1; break
+    fi
+    IFS=$'\t' read -r ver file sha <<<"$line"
+    sub "downloading ${pkg} ${ver}"
+    if ! curl -fsSL --max-time 300 -o "${tmpd}/${pkg}.deb" "${base}/${file}"; then
+      warn "download failed: ${base}/${file}"; rc=1; break
+    fi
+    if ! printf '%s  %s\n' "$sha" "${tmpd}/${pkg}.deb" | sha256sum -c --status; then
+      warn "checksum mismatch for ${pkg} ${ver} — refusing to install it"; rc=1; break
+    fi
+    debs+=("${tmpd}/${pkg}.deb")
+  done
+  if (( rc == 0 )) && (( ${#debs[@]} )); then
+    ms_apt_install "${debs[@]}" || rc=1
+  fi
+  rm -rf "$tmpd"
+  return "$rc"
+}
+
 if [[ "$SKIP_MSSQL" != "1" ]]; then
-  if [[ -x /opt/mssql-tools18/bin/sqlcmd ]] && apt_installable mssql-tools18; then
+  ms_done=0
+  if [[ -x "$MS_BIN/sqlcmd" ]]; then
     log "sqlcmd already installed"
-    sub "from: $(apt-cache policy mssql-tools18 | awk '/\*\*\*/{getline; print $2}' | head -1)"
-  elif apt_installable mssql-tools18; then
-    # A Microsoft repo is already configured on this host (very common — it
-    # arrives with packages-microsoft-prod.deb) and already offers the package.
-    # Adding our own source for the same repo would create the Signed-By
-    # conflict that breaks every apt update on apt 3.x.
-    log "mssql-tools18 reachable from an existing repo — installing"
-    sub "candidate $(apt_cand mssql-tools18)"
-    soft "mssql-tools18" sudo ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
-      apt-get install -y -qq mssql-tools18 msodbcsql18 unixodbc || true
+    sub "$MS_BIN/sqlcmd  ($(dpkg-query -W -f='${Version}' mssql-tools18 2>/dev/null || echo 'not from a package'))"
+    ms_done=1
   else
-    log "Configuring the Microsoft repository"
-    # Repos created after April 2025 (Ubuntu 25.10 / 26.04, Debian 13, RHEL 10)
-    # are signed with a key absent from microsoft.asc, giving
-    # NO_PUBKEY EE4D7792F748182B. Install both keys.
-    if fetch_keys /etc/apt/keyrings/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft-2025.asc; then
+    log "Installing the Microsoft SQL tooling"
+    ms_eula_preseed
 
-      ms_ok=0
+    # ---- route 1: a Microsoft repo that is already configured here ----------
+    if apt_installable mssql-tools18; then
+      sub "already reachable from a configured repo (candidate $(apt_cand mssql-tools18))"
+      ms_apt_install mssql-tools18 && ms_done=1
+      (( ms_done )) || warn "that repo could not deliver the package — trying the other routes"
+    fi
+
+    # ---- probe: which suite actually carries the packages? ------------------
+    # Asked over plain HTTPS, so a broken apt configuration cannot produce a
+    # false negative, and the index we get is reused by route 3.
+    ms_base=""; ms_idx=""; ms_suite=""; ms_relver=""; ms_tried=" "
+    if (( ! ms_done )); then
+      ms_probe="$(mktemp)"
       for pair in "${OS_VER}:${OS_CODE}" "25.10:questing" "24.04:noble" "22.04:jammy"; do
-        ms_ver="${pair%%:*}"; ms_suite="${pair##*:}"
-        [[ -z "$ms_ver" || -z "$ms_suite" ]] && continue
-
-        # Ask the repo directly over HTTPS. Independent of apt state, so a
-        # broken apt config cannot produce a false negative.
-        printf '    %-16s ' "${ms_ver}/${ms_suite}"
-        if ! ms_body="$(curl -fsSL --max-time 60 \
-             "https://packages.microsoft.com/ubuntu/${ms_ver}/prod/dists/${ms_suite}/main/binary-${ARCH}/Packages" 2>/dev/null)"; then
+        p_ver="${pair%%:*}"; p_suite="${pair##*:}"
+        [[ -z "$p_ver" || -z "$p_suite" ]] && continue
+        [[ "$ms_tried" == *" ${p_ver}/${p_suite} "* ]] && continue
+        ms_tried+="${p_ver}/${p_suite} "
+        printf '    %-16s ' "${p_ver}/${p_suite}"
+        if ! curl -fsSL --max-time 60 -o "$ms_probe" \
+             "https://packages.microsoft.com/ubuntu/${p_ver}/prod/dists/${p_suite}/main/binary-${ARCH}/Packages" 2>/dev/null; then
           echo "no package index"; continue
         fi
-        ms_t="$(printf '%s' "$ms_body" | grep -c '^Package: mssql-tools18$')"
-        ms_o="$(printf '%s' "$ms_body" | grep -c '^Package: msodbcsql18$')"
+        ms_t="$(grep -c '^Package: mssql-tools18$' "$ms_probe")"
+        ms_o="$(grep -c '^Package: msodbcsql18$'  "$ms_probe")"
         echo "mssql-tools18=${ms_t} msodbcsql18=${ms_o}"
         (( ms_t > 0 && ms_o > 0 )) || continue
+        ms_relver="$p_ver"; ms_suite="$p_suite"
+        ms_base="https://packages.microsoft.com/ubuntu/${p_ver}/prod"
+        ms_idx="$(mktemp)"; cp "$ms_probe" "$ms_idx"
+        break
+      done
+      rm -f "$ms_probe"
+      [[ -n "$ms_base" && "$ms_relver" != "$OS_VER" ]] && \
+        warn "Microsoft has no Ubuntu ${OS_VER} build — using the ${ms_relver} (${ms_suite}) packages"
+    fi
 
+    # ---- route 2: our own source for that suite -----------------------------
+    if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
+      if fetch_keys /etc/apt/keyrings/microsoft.asc \
+           https://packages.microsoft.com/keys/microsoft.asc \
+           https://packages.microsoft.com/keys/microsoft-2025.asc; then
         if add_repo /etc/apt/sources.list.d/mssql-release.sources \
-             "https://packages.microsoft.com/ubuntu/${ms_ver}/prod" \
-             "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
+             "$ms_base" "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
+          # A repo for another release must not become a general-purpose source:
+          # noble/prod alone carries ~100 packages (powershell, moby, kubectl)
+          # built for the wrong Ubuntu. Pin the whole suite out of reach and let
+          # only the two SQL packages back through.
+          if [[ "$ms_suite" != "$OS_CODE" ]]; then
+            sudo tee /etc/apt/preferences.d/mssql-release.pref >/dev/null <<EOF
+${MANAGED}
+Package: *
+Pin: release n=${ms_suite}
+Pin-Priority: 1
+
+Package: msodbcsql18 mssql-tools18
+Pin: release n=${ms_suite}
+Pin-Priority: 500
+EOF
+            sub "pinned: only msodbcsql18/mssql-tools18 may come from ${ms_suite}"
+          fi
           sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
           if apt_installable mssql-tools18; then
-            [[ "$ms_ver" != "$OS_VER" ]] && \
-              warn "Microsoft has no Ubuntu ${OS_VER} build — using ${ms_ver} (${ms_suite}) packages"
-            ms_ok=1; break
+            sub "candidate $(apt_cand mssql-tools18) from ${ms_relver}/${ms_suite}"
+            ms_apt_install mssql-tools18 && ms_done=1
+          else
+            warn "the ${ms_suite} source produced no installable candidate — removing it again"
+            sudo rm -f /etc/apt/sources.list.d/mssql-release.sources \
+                       /etc/apt/preferences.d/mssql-release.pref
+            sudo apt-get update -qq >/dev/null 2>&1 || true
           fi
-          sudo rm -f /etc/apt/sources.list.d/mssql-release.sources
         fi
-      done
-
-      if (( ms_ok )); then
-        soft "mssql-tools18" sudo ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
-          apt-get install -y -qq msodbcsql18 mssql-tools18 unixodbc || true
       else
-        warn "No Microsoft repo carries mssql-tools18 for ${ARCH}."
-        warn "Alternative — go-sqlcmd (static binary, no ODBC; sqlcmd but no bcp):"
-        warn "  curl -fsSL https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2 | tar xj -C ~/.local/bin sqlcmd"
-        note_fail "mssql-tools18"
-        sudo apt-get update -qq >/dev/null 2>&1 || true
+        warn "could not download the Microsoft signing keys"
       fi
+    fi
+
+    # ---- route 3: the .deb files straight from the pool ---------------------
+    if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
+      warn "repo route did not work — installing the .deb files from the pool"
+      ms_pool_install "$ms_base" "$ms_idx" && ms_done=1
+    fi
+    [[ -n "$ms_idx" ]] && rm -f "$ms_idx"
+
+    # ---- last resort: go-sqlcmd --------------------------------------------
+    if (( ! ms_done )); then
+      [[ -n "$ms_base" ]] || warn "no Microsoft repo carries mssql-tools18 for ${ARCH}"
+      warn "falling back to go-sqlcmd (static binary: sqlcmd only — no bcp, no ODBC driver)"
+      if curl -fsSL --max-time 300 \
+           "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2" \
+           | tar xj -C "$HOME/.local/bin" sqlcmd 2>/dev/null; then
+        sub "installed $HOME/.local/bin/sqlcmd"
+        note_fail "mssql-tools18 (go-sqlcmd installed instead)"
+      else
+        warn "that failed too — this machine has no sqlcmd"
+        note_fail "mssql-tools18"
+      fi
+    fi
+  fi
+
+  # /opt/mssql-tools18/bin is on no one's PATH by default; rc.sh appends it when
+  # the directory exists, so a login shell picks it up from the next start.
+  # Checked by what it prints rather than by its exit status: `sqlcmd -?` is a
+  # usage screen, and usage screens are not required to exit 0.
+  if [[ -x "$MS_BIN/sqlcmd" ]]; then
+    ms_v="$("$MS_BIN/sqlcmd" -? 2>&1 | awk '/Version/{print $2; exit}')"
+    if [[ -n "$ms_v" ]]; then
+      sub "sqlcmd ${ms_v} — ${MS_BIN}/sqlcmd (on PATH from the next login shell)"
     else
-      warn "could not download the Microsoft signing keys"; note_fail "mssql-tools18"
+      warn "sqlcmd is installed at ${MS_BIN}/sqlcmd but did not report a version"
     fi
   fi
 fi
@@ -1540,7 +1762,11 @@ ver python3  "$(python3 --version 2>/dev/null | awk '{print $2}')"
 ver uv       "$("$HOME/.local/bin/uv" --version 2>/dev/null | awk '{print $2}')"
 ver claude   "$("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}')"
 ver psql     "$(psql --version 2>/dev/null | awk '{print $3}')"
-ver sqlcmd   "$(/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | awk '/Version/{print $2; exit}')"
+# sqlcmd is either the mssql-tools18 build or the go-sqlcmd fallback binary.
+sqlcmd_ver="$(/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | awk '/Version/{print $2; exit}')"
+[[ -z "$sqlcmd_ver" && -x "$HOME/.local/bin/sqlcmd" ]] && \
+  sqlcmd_ver="$("$HOME/.local/bin/sqlcmd" --version 2>/dev/null | awk '{print $NF; exit}') (go-sqlcmd)"
+ver sqlcmd   "$sqlcmd_ver"
 ver nano     "$(nano --version 2>/dev/null | head -1 | awk '{print $NF}')"
 ver micro    "$(micro -version 2>/dev/null | awk -F': ' '/Version/{print $2}')"
 ver eza      "$(eza --version 2>/dev/null | awk '/^v/{print $1; exit}')"
