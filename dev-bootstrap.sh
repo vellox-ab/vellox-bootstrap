@@ -36,15 +36,18 @@ set -uo pipefail
 DEV_ROOT="${DEV_ROOT:-/srv/dev}"
 DEV_GROUP="${DEV_GROUP:-devgroup}"
 NODE_MAJOR="${NODE_MAJOR:-22}"          # minimum acceptable Node major
+DOTNET_MAJOR="${DOTNET_MAJOR:-}"        # empty = newest SDK the distro offers
+DOTNET_TOOLS="${DOTNET_TOOLS:-csharp-ls dotnet-ef}"
 PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | vim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
-CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp}"
+CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
 SKIP_SYSTEM="${SKIP_SYSTEM:-0}"
 SKIP_NODE="${SKIP_NODE:-0}"
 SKIP_PYTHON="${SKIP_PYTHON:-0}"
+SKIP_DOTNET="${SKIP_DOTNET:-0}"
 SKIP_MSSQL="${SKIP_MSSQL:-0}"
 SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
@@ -369,7 +372,11 @@ if [[ "$SKIP_NODE" != "1" ]]; then
     npm config set prefix "$HOME/.local" >/dev/null 2>&1 || true
     npm config set fund false >/dev/null 2>&1 || true
     log "Installing global npm tooling"
+    # pyright and typescript-language-server are here for a reason: the
+    # pyright-lsp / typescript-lsp plugins only *declare* the server command,
+    # they never install it. Without these two the plugins load and do nothing.
     npm install -g --silent npm@latest typescript ts-node tsx eslint prettier \
+      typescript-language-server pyright pnpm \
       nodemon pm2 mssql 2>/dev/null || warn "some npm globals failed"
   fi
 fi
@@ -388,6 +395,59 @@ if [[ "$SKIP_PYTHON" != "1" ]]; then
     for pkg in ruff black isort ipython httpie sqlfluff pre-commit pgcli; do
       pipx install "$pkg" >/dev/null 2>&1 || pipx upgrade "$pkg" >/dev/null 2>&1 \
         || { warn "pipx: $pkg failed"; note_fail "pipx:$pkg"; }
+    done
+  fi
+fi
+
+# =================================================================== .NET ===
+# Ubuntu ships .NET itself now (26.04 -> 10.0, 24.04 -> 8.0), and that is the
+# path of least resistance: no extra apt source to conflict with, and security
+# updates arrive with the distro. DOTNET_MAJOR pins one; empty means "newest the
+# distro offers". Only if the distro has none does Microsoft's official
+# installer put a private copy in ~/.dotnet.
+if [[ "$SKIP_DOTNET" != "1" ]]; then
+  cur_dotnet="$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | cut -d. -f1 | sort -rn | head -1)"
+  [[ "$cur_dotnet" =~ ^[0-9]+$ ]] || cur_dotnet=0
+  if (( cur_dotnet > 0 )); then
+    log ".NET SDK ${cur_dotnet}.x already present"
+  else
+    dn_pkg=""
+    if [[ -n "$DOTNET_MAJOR" ]]; then
+      apt_installable "dotnet-sdk-${DOTNET_MAJOR}.0" && dn_pkg="dotnet-sdk-${DOTNET_MAJOR}.0"
+      [[ -z "$dn_pkg" ]] && warn "Ubuntu ${OS_VER} has no dotnet-sdk-${DOTNET_MAJOR}.0 — taking what it has"
+    fi
+    if [[ -z "$dn_pkg" ]]; then
+      for dn_m in 10 9 8; do
+        if apt_installable "dotnet-sdk-${dn_m}.0"; then dn_pkg="dotnet-sdk-${dn_m}.0"; break; fi
+      done
+    fi
+    if [[ -n "$dn_pkg" ]]; then
+      log "Installing ${dn_pkg} from Ubuntu ${OS_VER}"
+      soft "$dn_pkg" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$dn_pkg"
+    else
+      log "Ubuntu ${OS_VER} carries no .NET SDK — using Microsoft's installer (~/.dotnet)"
+      soft "dotnet (dot.net installer)" bash -c \
+        'curl -fsSL --max-time 300 https://dot.net/v1/dotnet-install.sh \
+           | bash -s -- --channel LTS --install-dir "$HOME/.dotnet" --no-path' || true
+    fi
+  fi
+
+  # Global tools live in ~/.dotnet/tools. csharp-ls is not optional decoration:
+  # it is the binary the csharp-lsp plugin shells out to.
+  if have dotnet || [[ -x "$HOME/.dotnet/dotnet" ]]; then
+    export PATH="$HOME/.dotnet:$HOME/.dotnet/tools:$PATH"
+    export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+    log "Installing .NET global tools"
+    dn_have="$(dotnet tool list -g 2>/dev/null | awk 'NR>2{print $1}')"
+    for dn_t in $DOTNET_TOOLS; do
+      if grep -qx "$dn_t" <<<"$dn_have"; then
+        sub "${dn_t} already installed"
+      else
+        sub "installing ${dn_t}"
+        dotnet tool install -g "$dn_t" >/dev/null 2>&1 \
+          || dotnet tool update -g "$dn_t" >/dev/null 2>&1 \
+          || { warn "dotnet tool failed: ${dn_t}"; note_fail "dotnet-tool:${dn_t}"; }
+      fi
     done
   fi
 fi
@@ -515,6 +575,23 @@ STATUSLINE
       sub "installing plugin ${cc_plug}"
       timeout 180 claude plugin install "${cc_plug}@claude-plugins-official" >/dev/null 2>&1 \
         || { warn "could not install the ${cc_plug} plugin"; note_fail "plugin:${cc_plug}"; }
+    fi
+  done
+
+  # An LSP plugin only DECLARES the server command — it never installs it. A
+  # plugin whose binary is missing loads fine and then does nothing at all, so
+  # it is worth saying so out loud. The servers themselves come from the node
+  # section (pyright, typescript-language-server) and the .NET one (csharp-ls).
+  for cc_pair in "pyright-lsp:pyright-langserver" \
+                 "typescript-lsp:typescript-language-server" \
+                 "csharp-lsp:csharp-ls"; do
+    cc_plug="${cc_pair%%:*}"; cc_bin="${cc_pair##*:}"
+    [[ " $CLAUDE_PLUGINS " == *" $cc_plug "* ]] || continue
+    if have "$cc_bin" || [[ -x "$HOME/.local/bin/$cc_bin" || -x "$HOME/.dotnet/tools/$cc_bin" ]]; then
+      sub "${cc_plug} → ${cc_bin} found"
+    else
+      warn "${cc_plug} is installed but ${cc_bin} is not on PATH — that language server will not start"
+      note_fail "lsp:${cc_bin}"
     fi
   done
 fi
@@ -670,8 +747,22 @@ __path_dedupe() {
 }
 __path_prepend "$HOME/.local/bin"
 [ -d /opt/mssql-tools18/bin ] && __path_append /opt/mssql-tools18/bin
+# .NET: global tools (dotnet-ef, csharp-ls, ...) always; ~/.dotnet only when it
+# holds a private SDK. DOTNET_ROOT is set ONLY in that case — pointing it at
+# ~/.dotnet while dotnet came from apt (/usr/lib/dotnet) breaks every command.
+[ -d "$HOME/.dotnet/tools" ] && __path_append "$HOME/.dotnet/tools"
+if [ -x "$HOME/.dotnet/dotnet" ]; then
+  __path_append "$HOME/.dotnet"
+  export DOTNET_ROOT="$HOME/.dotnet"
+fi
 __path_dedupe
 export PATH
+
+# ---- .NET -------------------------------------------------------------------
+# NOLOGO drops the first-run banner that otherwise lands in the middle of build
+# output; the telemetry opt-out is the documented DOTNET_CLI_TELEMETRY_OPTOUT.
+export DOTNET_CLI_TELEMETRY_OPTOUT=1
+export DOTNET_NOLOGO=1
 
 # ---- truecolor --------------------------------------------------------------
 # micro, bat, delta and Claude Code all check COLORTERM for 24-bit support.
@@ -1887,6 +1978,7 @@ ver npm      "$(npm --version 2>/dev/null)"
 ver python3  "$(python3 --version 2>/dev/null | awk '{print $2}')"
 ver uv       "$("$HOME/.local/bin/uv" --version 2>/dev/null | awk '{print $2}')"
 ver claude   "$("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}')"
+ver dotnet   "$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | tail -1)"
 ver psql     "$(psql --version 2>/dev/null | awk '{print $3}')"
 # sqlcmd is either the mssql-tools18 build or the go-sqlcmd fallback binary.
 sqlcmd_ver="$(/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | awk '/Version/{print $2; exit}')"

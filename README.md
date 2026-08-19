@@ -44,14 +44,16 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 | `DEV_ROOT` | `/srv/dev` | Shared development folder |
 | `DEV_GROUP` | `devgroup` | Group that owns `DEV_ROOT` |
 | `NODE_MAJOR` | `22` | Minimum acceptable Node major version |
+| `DOTNET_MAJOR` | empty | Pin an SDK major; empty takes the newest the distro has |
+| `DOTNET_TOOLS` | `csharp-ls dotnet-ef` | .NET global tools to install |
 | `PG_MAJOR` | `18` | Preferred PGDG client major version |
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `vim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
-| `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp` | Plugins to install from `claude-plugins-official` |
+| `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
-`SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
+`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
 `SKIP_EDITOR_CONF`, `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
 `SKIP_CLAUDE_CONF`, `SKIP_INPUTRC` — set any of them to `1`.
 
@@ -90,7 +92,16 @@ identity is still unset at the end.
   tools, `sqlite3`, `shellcheck`, `shfmt`, ODBC and build headers.
 - **Node.js** — from NodeSource when the distro version is older than
   `NODE_MAJOR`.
-- **Python** — `python3` with `venv`/`pip`/`dev`, `pipx`, and `uv`.
+- **Python** — `python3` with `venv`/`pip`/`dev`, `pipx`, `uv`, and the pipx
+  tools `ruff`, `black`, `isort`, `ipython`, `httpie`, `sqlfluff`, `pre-commit`
+  and `pgcli`.
+- **.NET** — the SDK from Ubuntu itself (26.04 → 10.0, 24.04 → 8.0); if the
+  release carries none, Microsoft's official installer puts a private copy in
+  `~/.dotnet`. Global tools from `DOTNET_TOOLS` land in `~/.dotnet/tools`:
+  `dotnet-ef` for EF Core, and `csharp-ls` because that is the binary the
+  `csharp-lsp` plugin runs. `DOTNET_ROOT` is exported **only** for the private
+  install — setting it against an apt-installed SDK breaks every `dotnet`
+  command.
 - **Claude Code** — installed to `~/.local/bin/claude` (alias `cc`), plus:
   - `~/.claude/statusline.sh`, a Catppuccin Mocha status line showing model,
     directory, git branch, context use and session cost. Fully managed —
@@ -101,8 +112,21 @@ identity is still unset at the end.
     **missing** are added, so anything you set with `/config` survives a re-run,
     and MCP servers are never touched — configure those by hand.
   - the `claude-plugins-official` marketplace, and the language-server plugins
-    in `CLAUDE_PLUGINS` (Pyright and TypeScript by default), which give Claude
-    real definitions and diagnostics instead of grep.
+    in `CLAUDE_PLUGINS` — Pyright, TypeScript and C# — which give Claude real
+    definitions and diagnostics instead of grep, at zero context cost (the
+    servers run out of process).
+
+    An LSP plugin only *declares* its server command; it never installs it. So
+    the servers come from the other sections — `pyright` and
+    `typescript-language-server` as npm globals, `csharp-ls` as a .NET tool —
+    and the run ends by checking each declared server is really on `PATH`,
+    because a plugin whose binary is missing loads happily and then does
+    nothing.
+
+  Worth doing by hand afterwards: run `/fewer-permission-prompts` in a session
+  once you have a week of history. It reads your transcripts and writes a
+  correct `permissions.allow` list for the commands you keep approving — better
+  than any list guessed up front.
 - **tmux** — a full `tmux.conf` with Catppuccin Mocha, vi copy mode, sane splits
   and navigation.
 - **Shell** — `~/.config/dev-bootstrap/rc.sh` with PATH, truecolor, a shared-dev
@@ -142,4 +166,4 @@ it installed, and lists anything that did not complete.
 
 ## Version
 
-Current version: **5.3.0** (see `VERSION`).
+Current version: **5.4.0** (see `VERSION`).
