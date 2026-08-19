@@ -17,6 +17,32 @@ bash dev-bootstrap.sh --clean-only     # only remove the apt artifacts we create
 bash dev-bootstrap.sh --help
 ```
 
+### On a brand-new server
+
+The repository is private, so the one-liner needs a token with read access to
+it (a fine-grained PAT scoped to this repo and `Contents: read` is enough):
+
+```bash
+GH_TOKEN=github_pat_xxx; curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap.sh \
+  | bash
+```
+
+Keeping the file around is nicer — re-runs, `--help` and `--clean-only` all
+work from it:
+
+```bash
+GH_TOKEN=github_pat_xxx; curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+  https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap.sh \
+  -o dev-bootstrap.sh && bash dev-bootstrap.sh
+```
+
+If the repository is ever made public, drop the header and the token:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap.sh | bash
+```
+
 Sections can be skipped, and a few settings overridden, with environment
 variables:
 

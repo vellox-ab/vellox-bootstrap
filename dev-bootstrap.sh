@@ -64,8 +64,15 @@ MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
 for arg in "$@"; do
   case "$arg" in
     --clean-only) CLEAN_ONLY=1 ;;
-    --help|-h) sed -n '/^# HELP>$/,/^# <HELP$/p' "$0" \
-                 | sed '1d;$d; s/^# \{0,1\}//'; exit 0 ;;
+    # "$0" is "bash" when the script is piped in from curl, and there is no
+    # file to read the help out of — point at the repo instead of failing.
+    --help|-h) if [[ -r "$0" ]]; then
+                 sed -n '/^# HELP>$/,/^# <HELP$/p' "$0" | sed '1d;$d; s/^# \{0,1\}//'
+               else
+                 echo "Reading the script from stdin — save it to a file for the help text:"
+                 echo "  curl -fsSL <url> -o dev-bootstrap.sh && bash dev-bootstrap.sh --help"
+               fi
+               exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
