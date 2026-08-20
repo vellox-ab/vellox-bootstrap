@@ -938,17 +938,23 @@ STATUSLINE
   # with "not found in marketplace". Adding it records the source in
   # settings.json (extraKnownMarketplaces) and clones it, so this is a one-off
   # per machine — repeating it is harmless but slow, hence the check.
-  if ! claude plugin marketplace list 2>/dev/null | grep -qF claude-plugins-official; then
+  #
+  # Every claude call gets </dev/null and a --foreground timeout. claude puts a
+  # TTY it finds on stdin into raw mode, and a plain `timeout` runs its child in
+  # a background process group — so that child gets SIGTTOU the moment it
+  # touches the terminal and is STOPPED by the kernel, not killed. The timeout
+  # never fires on a stopped process, and the script sits there forever.
+  if ! claude plugin marketplace list </dev/null 2>/dev/null | grep -qF claude-plugins-official; then
     sub "adding the claude-plugins-official marketplace"
-    timeout 180 claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1 \
+    timeout --foreground 180 claude plugin marketplace add anthropics/claude-plugins-official </dev/null >/dev/null 2>&1 \
       || warn "could not add the plugin marketplace"
   fi
   for cc_plug in $CLAUDE_PLUGINS; do
-    if claude plugin list 2>/dev/null | grep -qF "$cc_plug"; then
+    if claude plugin list </dev/null 2>/dev/null | grep -qF "$cc_plug"; then
       sub "plugin ${cc_plug} already installed"
     else
       sub "installing plugin ${cc_plug}"
-      timeout 180 claude plugin install "${cc_plug}@claude-plugins-official" >/dev/null 2>&1 \
+      timeout --foreground 180 claude plugin install "${cc_plug}@claude-plugins-official" </dev/null >/dev/null 2>&1 \
         || { warn "could not install the ${cc_plug} plugin"; note_fail "plugin:${cc_plug}"; }
     fi
   done

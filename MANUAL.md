@@ -5,7 +5,7 @@ where it lives on disk, how the pieces fit together, and how to turn each one
 off. Written so that a person — or an AI session with this repository open —
 can answer "how does X work on this machine?" without reading the script.
 
-Script version: **5.7.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
+Script version: **5.7.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ---
 
@@ -595,6 +595,7 @@ Base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, mauve `#cba6f7`, green
 | Ctrl-R shows plain bash search | atuin missing, or `bash-preexec.sh` failed to download (the extras section warns); re-run |
 | Prompt is the old bash one | starship not installed, or `DEV_PROMPT=bash` in `local.sh` |
 | `reload` prints errors about `;;` | fixed in 5.7.0 — re-run to regenerate `rc.sh` |
+| `installing plugin pyright-lsp` hangs forever | fixed in 5.7.1 — `claude` was stopped by SIGTTOU under `timeout`; press Ctrl-C on the stuck run and re-run |
 | tmux keeps old bindings | the server predates the config; `tmux kill-server` or re-run (`DEV_TMUX_RESET=1`) |
 | `docker: permission denied` | group membership needs a new login (`newgrp docker`) |
 | A published container port is reachable despite ufw | Docker bypasses ufw by design; bind to `127.0.0.1` |
