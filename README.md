@@ -6,6 +6,11 @@ Supports **Ubuntu 24.04 LTS (noble)** and **26.04 LTS (resolute)** from the same
 file. Everything release-specific is detected at runtime, so there is nothing to
 edit per machine.
 
+For what every installed tool does, where its config lives and how the
+pieces fit together, see **[MANUAL.md](MANUAL.md)** — written so a person or
+an AI session can answer "how does X work on this machine?" without reading
+the script.
+
 ## Usage
 
 Run as your normal user — **not** root, **not** with `sudo`. The script asks for
