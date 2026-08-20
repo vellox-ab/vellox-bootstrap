@@ -49,6 +49,7 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 | `PG_MAJOR` | `18` | Preferred PGDG client major version |
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `vim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
+| `DEV_START_DIR` | asked for | Folder every login starts in; setting it skips the prompt |
 | `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
@@ -56,7 +57,8 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
 `SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
 `SKIP_EDITOR_CONF`, `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
-`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN` — set any of them to `1`.
+`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set
+any of them to `1`.
 
 ### Git identity
 
@@ -83,6 +85,37 @@ SKIP_GIT_IDENTITY=1 bash dev-bootstrap.sh    # never ask, leave the identity alo
 The prompt reads from `/dev/tty`, so it also works when the script is piped into
 `bash`. With no terminal attached it is skipped, and the git section warns if the
 identity is still unset at the end.
+
+### Start folder
+
+Right after the identity, the script asks which folder a login should start in:
+
+```
+==> Start folder
+    every login starts here: the tmux session opens in it, and so does a
+    login shell when the tmux autostart is off
+    Folder         [/srv/dev]:
+```
+
+The default is your previous answer, or `DEV_ROOT` if it exists, or `$HOME` — so
+the first run is one keystroke and every re-run after it is just Enter. A `~` is
+expanded, a relative path is refused, and a folder that does not exist yet is
+offered for creation.
+
+The answer ends up in two places at login: `tmux new-session -c` when the tmux
+autostart creates the `dev` session, and a `cd` for a login shell that starts in
+`$HOME` when it does not. A shell that was deliberately started somewhere else
+(`ssh host -t 'cd /x && bash -l'`, a new tmux pane, VS Code) is never moved.
+
+```bash
+DEV_START_DIR=/srv/dev/app bash dev-bootstrap.sh   # answer up front
+SKIP_START_DIR=1 bash dev-bootstrap.sh             # never ask
+```
+
+To change it later, re-run with `DEV_START_DIR=...`, or set it in
+`~/.config/dev-bootstrap/local.sh` — that file is sourced before either of the
+two places above reads the value, so it takes effect on the next login with no
+re-run at all.
 
 ## What it installs and configures
 
@@ -132,8 +165,9 @@ identity is still unset at the end.
   and navigation, applied to a running server as well as to new ones (see
   [Existing config on the machine](#existing-config-on-the-machine)).
 - **Shell** — `~/.config/dev-bootstrap/rc.sh` with PATH, truecolor, a shared-dev
-  umask, history tuning, a git-aware Catppuccin prompt, and aliases for listing,
-  git, databases, tmux, Python and misc tools. Your own overrides live in
+  umask, history tuning, a git-aware Catppuccin prompt, aliases for listing,
+  git, databases, tmux, Python and misc tools, and the start folder every login
+  lands in. Your own overrides live in
   `~/.config/dev-bootstrap/local.sh` and are never overwritten.
 - **Completions and `inputrc`** — history search on the arrow keys, word-wise
   movement, working Home/End in every terminal flavour.
@@ -212,4 +246,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.5.0** (see `VERSION`).
+Current version: **5.6.0** (see `VERSION`).

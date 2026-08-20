@@ -41,6 +41,13 @@
 #   GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap.sh
 #   SKIP_GIT_IDENTITY=1 bash dev-bootstrap.sh    # never ask, leave git alone
 #
+# It also asks which folder a login should start in: the folder the tmux
+# session opens in, and the one a login shell cds to when tmux is off. The
+# answer is remembered, so every re-run after the first is just Enter.
+#
+#   DEV_START_DIR=/srv/dev/app bash dev-bootstrap.sh   # answer up front
+#   SKIP_START_DIR=1 bash dev-bootstrap.sh             # never ask
+#
 # Deliberately NOT using `set -e`: a single failing repo must never leave the
 # machine half-configured. Failures are collected and reported at the end.
 #
@@ -56,6 +63,7 @@ DOTNET_TOOLS="${DOTNET_TOOLS:-csharp-ls dotnet-ef}"
 PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | vim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
+DEV_START_DIR="${DEV_START_DIR:-}"      # empty = ask; where a login lands
 CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
@@ -75,6 +83,7 @@ SKIP_GIT_CONF="${SKIP_GIT_CONF:-0}"
 SKIP_GIT_IDENTITY="${SKIP_GIT_IDENTITY:-0}"
 SKIP_INPUTRC="${SKIP_INPUTRC:-0}"
 SKIP_LEGACY_CLEAN="${SKIP_LEGACY_CLEAN:-0}"   # 1 = leave old config in place
+SKIP_START_DIR="${SKIP_START_DIR:-0}"         # 1 = never ask for a start folder
 DEV_TMUX_RESET="${DEV_TMUX_RESET:-1}"         # 0 = do not touch a running server
 CLEAN_ONLY=0
 
@@ -83,6 +92,7 @@ MARKER="# >>> dev-bootstrap >>>"
 MARKER_END="# <<< dev-bootstrap <<<"
 MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
 BACKUP_SUFFIX=".pre-bootstrap"
+START_DIR_STATE="$CONF_DIR/start-dir"   # remembers the answer between runs
 
 for arg in "$@"; do
   case "$arg" in
@@ -259,7 +269,8 @@ ask_tty() {                    # ask_tty <varname> <question> <default>
 GIT_IDENT_FROM_ENV=0
 [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]] && GIT_IDENT_FROM_ENV=1
 
-if [[ "$SKIP_GIT_CONF" != "1" && "$SKIP_GIT_IDENTITY" != "1" && "$GIT_IDENT_FROM_ENV" != "1" ]]; then
+if [[ "$CLEAN_ONLY" != "1" && "$SKIP_GIT_CONF" != "1" \
+      && "$SKIP_GIT_IDENTITY" != "1" && "$GIT_IDENT_FROM_ENV" != "1" ]]; then
   # git may not be installed yet on a fresh box; an empty default is fine.
   if have git; then
     [[ -z "$GIT_USER_NAME"  ]] && GIT_USER_NAME="$(git config --global user.name  2>/dev/null || true)"
@@ -284,6 +295,69 @@ if [[ "$SKIP_GIT_CONF" != "1" && "$SKIP_GIT_IDENTITY" != "1" && "$GIT_IDENT_FROM
     sub "commits will be authored as: ${GIT_USER_NAME} <${GIT_USER_EMAIL}>"
   fi
 fi
+
+# ---------------------------------------------------------- start folder ----
+# Where a login lands: the folder the tmux session opens in, and the folder a
+# login shell cds to when the tmux autostart is off. Asked here, next to the
+# identity, for the same reason — a question that only appears after twenty
+# minutes of package installs is a question nobody is there to answer.
+#
+# Precedence: DEV_START_DIR from the environment wins outright and suppresses
+# the prompt, then the answer from the last run, then DEV_ROOT if it exists,
+# then $HOME. Whatever comes out is offered as the default you can take with
+# Enter, so a re-run is just Enter.
+start_dir_default="$DEV_START_DIR"
+[[ -z "$start_dir_default" && -s "$START_DIR_STATE" ]] && \
+  start_dir_default="$(head -1 "$START_DIR_STATE")"
+[[ -z "$start_dir_default" && -d "$DEV_ROOT" ]] && start_dir_default="$DEV_ROOT"
+[[ -z "$start_dir_default" ]] && start_dir_default="$HOME"
+
+if [[ "$CLEAN_ONLY" != "1" && "$SKIP_START_DIR" != "1" && -z "$DEV_START_DIR" ]] \
+   && (exec </dev/tty) 2>/dev/null; then
+  log "Start folder"
+  sub "every login starts here: the tmux session opens in it, and so does a"
+  sub "login shell when the tmux autostart is off"
+  start_answer=""; start_create=""      # ask_tty fills these in with printf -v
+  while :; do
+    ask_tty start_answer "Folder" "$start_dir_default"
+    # read never expands a tilde, and a trailing slash would show up in every
+    # prompt and every status line.
+    start_answer="${start_answer/#\~/$HOME}"
+    start_answer="${start_answer%/}"; [[ -z "$start_answer" ]] && start_answer="/"
+    if [[ "$start_answer" != /* ]]; then
+      warn "that has to be a full path — starting with / (or ~)"
+      continue
+    fi
+    if [[ -d "$start_answer" ]]; then
+      if [[ -r "$start_answer" && -x "$start_answer" ]]; then
+        DEV_START_DIR="$start_answer"; break
+      fi
+      warn "$start_answer exists but you cannot cd into it"
+      continue
+    fi
+    warn "$start_answer does not exist yet"
+    ask_tty start_create "Create it? (y/n)" "y"
+    if [[ "$start_create" == [Yy]* ]]; then
+      if mkdir -p "$start_answer" 2>/dev/null; then
+        sub "created $start_answer"
+        DEV_START_DIR="$start_answer"; break
+      fi
+      warn "could not create it — no permission, or a file is in the way"
+    fi
+  done
+  sub "logins will start in ${DEV_START_DIR}"
+fi
+
+# Nothing was asked (no terminal, SKIP_START_DIR, or a value from the
+# environment): settle on the default and normalise it the same way.
+[[ -z "$DEV_START_DIR" ]] && DEV_START_DIR="$start_dir_default"
+DEV_START_DIR="${DEV_START_DIR/#\~/$HOME}"
+DEV_START_DIR="${DEV_START_DIR%/}"; [[ -z "$DEV_START_DIR" ]] && DEV_START_DIR="/"
+[[ -d "$DEV_START_DIR" ]] || \
+  warn "start folder $DEV_START_DIR does not exist — logins will fall back to \$HOME"
+# Remembered so the next run can offer it as the default, and so this stays
+# put when a later run has no terminal to ask from.
+[[ "$CLEAN_ONLY" == "1" ]] || printf '%s\n' "$DEV_START_DIR" > "$START_DIR_STATE" 2>/dev/null || true
 
 # =============================================================== cleanup ====
 # Remove every apt artifact this script family has ever created, in any format,
@@ -770,12 +844,14 @@ if [[ "$SKIP_LEGACY_CLEAN" != "1" ]]; then
   # ---- 4. our own generated files that no longer belong to any section -----
   # rc.sh, theme.sh and completions/ are regenerated below, so whatever else is
   # in there came from an older version of this script and is now dead weight:
-  # nothing sources it any more. Anything called local* is yours and stays.
+  # nothing sources it any more. Anything called local* is yours and stays, and
+  # so does start-dir: it is this run's memory of the start-folder answer.
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     rm -rf "$f"; sub "removed stale $(hp "$f")"; legacy_cleaned=$((legacy_cleaned+1))
   done < <(find "$CONF_DIR" -mindepth 1 -maxdepth 1 \
-             ! -name 'local*' ! -name rc.sh ! -name theme.sh ! -name completions 2>/dev/null)
+             ! -name 'local*' ! -name rc.sh ! -name theme.sh ! -name completions \
+             ! -name start-dir 2>/dev/null)
 
   (( legacy_cleaned == 0 )) && sub "nothing left over to clean"
 fi
@@ -956,6 +1032,7 @@ if [[ "$SKIP_SHELL_CONF" != "1" ]]; then
 # ---- values baked in when the bootstrap ran (env still wins) ----------------
 export DEV_ROOT="\${DEV_ROOT:-${DEV_ROOT}}"
 export DEV_EDITOR="\${DEV_EDITOR:-${DEV_EDITOR}}"
+export DEV_START_DIR="\${DEV_START_DIR:-${DEV_START_DIR}}"
 DEV_TMUX_AUTOSTART="\${DEV_TMUX_AUTOSTART:-${DEV_TMUX_AUTOSTART}}"
 EOF
 
@@ -1326,10 +1403,30 @@ case "${PROMPT_COMMAND:-}" in
 esac
 
 # ---- your own overrides -----------------------------------------------------
+# Sourced before the two things below that read DEV_START_DIR, so setting it in
+# local.sh is enough to move where you land — no re-run needed.
 [ -f "$HOME/.config/dev-bootstrap/local.sh" ] && . "$HOME/.config/dev-bootstrap/local.sh"
 
+# ---- land in the start folder ----------------------------------------------
+# Only on a real LOGIN shell, and only when it started in $HOME: a shell that
+# was put somewhere on purpose stays there. That covers `ssh host -t "cd /x &&
+# bash -l"`, a new tmux pane (which inherits the pane's directory), VS Code,
+# and every non-login shell, none of which should be moved.
+#
+# With the tmux autostart on this is usually a no-op — the session below is
+# opened with -c "$DEV_START_DIR" already — but it is what makes the folder
+# take effect when tmux is off, opted out of, or not installed.
+__start_dir() {
+  [ -n "${DEV_START_DIR:-}" ] || return
+  shopt -q login_shell         || return
+  [ "$PWD" = "$HOME" ]         || return
+  [ -d "$DEV_START_DIR" ]      || return
+  cd "$DEV_START_DIR" 2>/dev/null || true
+}
+__start_dir
+
 # ---- auto-attach tmux on login ---------------------------------------------
-# Lands you in a tmux session named "dev" rooted at $DEV_ROOT.
+# Lands you in a tmux session named "dev" rooted at $DEV_START_DIR.
 # Deliberately conservative: only for real interactive logins.
 # Escape hatches:
 #   touch ~/.no-auto-tmux        (permanent, per user)
@@ -1349,7 +1446,9 @@ __auto_tmux() {
   command -v tmux >/dev/null 2>&1    || return
   [ -t 0 ] && [ -t 1 ]               || return   # real tty on both ends
 
-  local root="${DEV_ROOT:-/srv/dev}"
+  # -c only applies when the session is CREATED; attaching to a session that
+  # already exists keeps that session's own directory, which is correct.
+  local root="${DEV_START_DIR:-${DEV_ROOT:-/srv/dev}}"
   [ -d "$root" ] || root="$HOME"
   tmux new-session -A -s dev -c "$root"
 }
@@ -2210,6 +2309,7 @@ probe="$(env -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY \
 if grep -q "alias ll=" <<<"$probe"; then
   sub "ll / la / lt available on login"
   sub "$(grep -o 'EDITOR=.*' <<<"$probe" | head -1)"
+  sub "start folder: $DEV_START_DIR"
 else
   warn "a login shell still does not load $CONF_DIR/rc.sh"
   warn "check ~/.bash_profile — something before our block may be exiting early"
@@ -2259,6 +2359,7 @@ sub "exec bash -l                 # pick up PATH, theme, aliases"
 sub "ll                           # long listing (also: la lt lt3 ltr lsz ldot)"
 sub "claude                       # authenticate once; 'cc' is the shortcut"
 sub "touch ~/.no-auto-tmux        # if you don't want tmux on login"
+sub "DEV_START_DIR=/path bash $0  # change where logins start"
 sub "\$EDITOR ~/.config/dev-bootstrap/local.sh   # your own aliases, never overwritten"
 sub "ls ~/.*.pre-bootstrap        # the config you had before the first run"
 sub "bash $0 --clean-only         # remove this script's apt sources"
