@@ -19,6 +19,16 @@
 #
 #   SKIP_MSSQL=1 bash dev-bootstrap.sh     # skip a section
 #   DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
+#   DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
+#
+# Beyond the base packages it installs a set of extra tools (lazygit, atuin,
+# starship, mise, watchexec, difftastic, yazi, lnav, mosh, ttyd, ...), Docker
+# from Docker's own repo, and a light hardening pass (unattended-upgrades,
+# fail2ban, ufw). The firewall trusts the private ranges in DEV_UFW_TRUST, so a
+# box reached over a LAN or VPN is never cut off by it.
+#
+#   SKIP_EXTRAS=1 SKIP_DOCKER=1 SKIP_HARDENING=1 bash dev-bootstrap.sh
+#   DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap.sh
 #
 # Config files (~/.tmux.conf, ~/.inputrc, ~/.nanorc, ~/.psqlrc, the micro and
 # Claude Code files) are written WHOLE — they belong to this script. What was
@@ -61,7 +71,7 @@ NODE_MAJOR="${NODE_MAJOR:-22}"          # minimum acceptable Node major
 DOTNET_MAJOR="${DOTNET_MAJOR:-}"        # empty = newest SDK the distro offers
 DOTNET_TOOLS="${DOTNET_TOOLS:-csharp-ls dotnet-ef}"
 PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
-DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | vim
+DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | nvim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
 DEV_START_DIR="${DEV_START_DIR:-}"      # empty = ask; where a login lands
 CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
@@ -73,6 +83,13 @@ SKIP_PYTHON="${SKIP_PYTHON:-0}"
 SKIP_DOTNET="${SKIP_DOTNET:-0}"
 SKIP_MSSQL="${SKIP_MSSQL:-0}"
 SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
+SKIP_EXTRAS="${SKIP_EXTRAS:-0}"         # lazygit, atuin, starship, mise, ...
+SKIP_DOCKER="${SKIP_DOCKER:-0}"
+SKIP_HARDENING="${SKIP_HARDENING:-0}"   # unattended-upgrades, fail2ban, ufw
+DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
+# Networks the firewall and fail2ban trust outright: every RFC 1918 range, so a
+# LAN or VPN is never locked out. SSH is allowed from everywhere regardless.
+DEV_UFW_TRUST="${DEV_UFW_TRUST:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
 SKIP_CLAUDE_CONF="${SKIP_CLAUDE_CONF:-0}"
 SKIP_TMUX_CONF="${SKIP_TMUX_CONF:-0}"
@@ -372,6 +389,8 @@ LEGACY_SOURCES=(
   /etc/apt/sources.list.d/nodesource.sources
   /etc/apt/sources.list.d/pgdg.list
   /etc/apt/sources.list.d/pgdg.sources
+  /etc/apt/sources.list.d/docker.list
+  /etc/apt/sources.list.d/docker.sources
   /etc/apt/preferences.d/mssql-release.pref
 )
 LEGACY_KEYS=(
@@ -381,6 +400,8 @@ LEGACY_KEYS=(
   /etc/apt/keyrings/nodesource.asc
   /etc/apt/keyrings/pgdg.gpg
   /etc/apt/keyrings/pgdg.asc
+  /etc/apt/keyrings/docker.gpg
+  /etc/apt/keyrings/docker.asc
 )
 removed=0
 for f in "${LEGACY_SOURCES[@]}" "${LEGACY_KEYS[@]}"; do
@@ -466,12 +487,16 @@ if [[ "$SKIP_SYSTEM" != "1" ]]; then
     git git-lfs gh git-delta
     curl wget ca-certificates gnupg apt-transport-https software-properties-common lsb-release
     unzip zip p7zip-full xz-utils zstd unrar-free
-    tmux vim nano micro less pspg
+    tmux neovim nano micro less pspg
     jq yq ripgrep fd-find fzf bat tree eza zoxide direnv vivid sd glow
-    htop btop ncdu iotop lsof strace du-dust duf hyperfine
+    htop btop ncdu iotop lsof strace du-dust duf hyperfine procs
     net-tools dnsutils iputils-ping traceroute mtr-tiny socat openssh-client rsync
+    mosh gping lnav ttyd fastfetch age tealdeer
     sqlite3 shellcheck shfmt acl attr
-    bash-completion moreutils entr just plocate dos2unix pv tokei trash-cli
+    bash-completion moreutils just plocate dos2unix pv tokei trash-cli
+    # Newer releases carry these; on older ones the extras section fetches
+    # the GitHub release instead.
+    lazygit starship atuin difftastic trippy
     xclip wl-clipboard
     python3 python3-venv python3-pip python3-dev pipx
     unixodbc unixodbc-dev libssl-dev libffi-dev zlib1g-dev
@@ -535,7 +560,10 @@ if [[ "$SKIP_NODE" != "1" ]]; then
     # they never install it. Without these two the plugins load and do nothing.
     npm install -g --silent npm@latest typescript ts-node tsx eslint prettier \
       typescript-language-server pyright pnpm \
-      nodemon pm2 mssql 2>/dev/null || warn "some npm globals failed"
+      nodemon pm2 mssql @ast-grep/cli 2>/dev/null || warn "some npm globals failed"
+    # @ast-grep/cli ships as both `ast-grep` and `sg`. The latter shadows
+    # /usr/bin/sg (the setgid helper) in interactive shells — harmless, but
+    # worth knowing; scripts still get the system one.
   fi
 fi
 
@@ -554,6 +582,15 @@ if [[ "$SKIP_PYTHON" != "1" ]]; then
       pipx install "$pkg" >/dev/null 2>&1 || pipx upgrade "$pkg" >/dev/null 2>&1 \
         || { warn "pipx: $pkg failed"; note_fail "pipx:$pkg"; }
     done
+    # harlequin: a TUI SQL IDE. The postgres adapter comes as an extra, the
+    # SQL Server one (through the msodbcsql18 driver) as a separate package.
+    if pipx list --short 2>/dev/null | grep -q '^harlequin '; then
+      pipx upgrade harlequin >/dev/null 2>&1 || true
+    else
+      pipx install 'harlequin[postgres]' >/dev/null 2>&1 \
+        || { warn "pipx: harlequin failed"; note_fail "pipx:harlequin"; }
+    fi
+    have harlequin && pipx inject harlequin harlequin-odbc >/dev/null 2>&1 || true
   fi
 fi
 
@@ -617,6 +654,186 @@ if [[ "$SKIP_CLAUDE" != "1" ]]; then
   else
     log "Installing Claude Code (native installer, per-user, auto-updating)"
     soft "claude-code" bash -c 'curl -fsSL --max-time 120 https://claude.ai/install.sh | bash' || true
+  fi
+fi
+
+# ============================================================ extra tools ===
+# Tools that make a headless box pleasant, installed the same way the base
+# packages are: from apt when this release carries them (they are in BASE_PKGS
+# for that reason), and otherwise from the project's latest GitHub release. A
+# .deb asset is preferred and goes through apt, so it is tracked and brings its
+# man page; anything else is unpacked and the binary put in ~/.local/bin.
+#
+# Already-present tools are left alone — there is no upgrade path for a binary
+# that did not come from apt, except DEV_EXTRAS_UPGRADE=1, which re-fetches all
+# of them.
+case "$ARCH" in
+  amd64) ARCH_RUST=x86_64;  ARCH_CROC=64bit ;;
+  arm64) ARCH_RUST=aarch64; ARCH_CROC=ARM64 ;;
+  *)     ARCH_RUST="$ARCH"; ARCH_CROC="$ARCH" ;;
+esac
+ARCH_RE="(${ARCH}|${ARCH_RUST})"     # projects name the arch either way
+
+# gh_asset_url <repo> <regex> — download URL of the first matching asset of the
+# latest release. An authenticated gh dodges the 60/hour anonymous API limit.
+gh_asset_url() {
+  local repo="$1" re="$2" json=""
+  if have gh && gh auth token >/dev/null 2>&1; then
+    json="$(gh api "repos/${repo}/releases/latest" 2>/dev/null)"
+  fi
+  [[ -n "$json" ]] || json="$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' \
+                         "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)"
+  [[ -n "$json" ]] || return 1
+  jq -r '.assets[]?.browser_download_url' <<<"$json" 2>/dev/null | grep -E "$re" | head -1 | grep .
+}
+
+# gh_bin <repo> <asset-regex> <binary> [binary...]
+gh_bin() {
+  local repo="$1" re="$2"; shift 2
+  local main="$1" url tmpd file rc=0 b found
+  if [[ "$DEV_EXTRAS_UPGRADE" != "1" ]] && have "$main"; then
+    sub "$(printf '%-11s' "$main") already present"; return 0
+  fi
+  if ! url="$(gh_asset_url "$repo" "$re")"; then
+    warn "${main}: no release asset for ${ARCH} in ${repo} (or the GitHub API is rate-limited)"
+    note_fail "$main"; return 1
+  fi
+  tmpd="$(mktemp -d)"; file="${tmpd}/${url##*/}"
+  if ! curl -fsSL --max-time 300 -o "$file" "$url"; then
+    warn "${main}: download failed — ${url}"; note_fail "$main"; rm -rf "$tmpd"; return 1
+  fi
+  case "$file" in
+    *.deb)           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$file" >/dev/null 2>&1 || rc=1 ;;
+    *.tar.gz|*.tgz)  tar xzf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
+    *.tar.xz)        tar xJf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
+    *.tar.bz2)       tar xjf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
+    *.zip)           unzip -qo "$file" -d "$tmpd" 2>/dev/null || rc=1 ;;
+    *)               mv "$file" "${tmpd}/${main}" ;;            # a bare binary
+  esac
+  if (( rc == 0 )) && [[ "$file" != *.deb ]]; then
+    for b in "$@"; do
+      found="$(find "$tmpd" -type f -name "$b" | head -1)"
+      if [[ -n "$found" ]]; then
+        install -m 0755 "$found" "$HOME/.local/bin/$b"
+      else
+        warn "${main}: ${b} is not in the archive"; rc=1
+      fi
+    done
+  fi
+  rm -rf "$tmpd"
+  if (( rc == 0 )); then
+    sub "$(printf '%-11s' "$main") ${url##*/}"
+  else
+    warn "could not install ${main}"; note_fail "$main"
+  fi
+  return "$rc"
+}
+
+if [[ "$SKIP_EXTRAS" != "1" ]]; then
+  log "Extra tools (apt where the release has them, GitHub releases otherwise)"
+  export PATH="$HOME/.local/bin:$PATH"
+  gh_bin jesseduffield/lazygit     "lazygit_.*_linux_${ARCH_RE}\.tar\.gz$"                 lazygit
+  gh_bin starship/starship         "starship-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"      starship
+  gh_bin atuinsh/atuin             "/atuin-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"        atuin
+  gh_bin watchexec/watchexec       "watchexec-.*-${ARCH_RUST}-unknown-linux-gnu\.deb$"      watchexec
+  gh_bin Wilfred/difftastic        "difft-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"         difft
+  gh_bin sxyazi/yazi               "yazi-${ARCH_RUST}-unknown-linux-gnu\.deb$"              yazi ya
+  gh_bin fujiapple852/trippy       "(trippy_.*_${ARCH}\.deb|trippy-.*-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz)$" trip
+  gh_bin o2sh/onefetch             "onefetch_${ARCH}\.deb$"                                 onefetch
+  gh_bin PaulJuliusMartinez/jless  "jless-.*-${ARCH_RUST}-unknown-linux-gnu\.zip$"          jless
+  gh_bin schollz/croc              "/croc_.*_Linux-${ARCH_CROC}\.tar\.gz$"                  croc
+  gh_bin getsops/sops              "sops_.*_${ARCH}\.deb$"                                  sops
+  gh_bin fastfetch-cli/fastfetch   "fastfetch-linux-${ARCH_RE}\.deb$"                       fastfetch
+  gh_bin dalance/procs             "procs-.*-${ARCH_RUST}-linux\.zip$"                      procs
+
+  # mise: one version manager for node/python/go/... driven by a .mise.toml in
+  # the project. It does nothing until a project pins a tool, so the apt node
+  # and dotnet stay the defaults. Its own installer, because the release
+  # assets are per-libc and it self-updates from there.
+  if [[ "$DEV_EXTRAS_UPGRADE" != "1" ]] && have mise; then
+    sub "$(printf '%-11s' mise) already present"
+  else
+    soft "mise" \
+      bash -c 'curl -fsSL --max-time 120 https://mise.run | MISE_INSTALL_PATH="$HOME/.local/bin/mise" sh >/dev/null 2>&1' \
+      && sub "$(printf '%-11s' mise) $("$HOME/.local/bin/mise" --version 2>/dev/null | awk '{print $1}')"
+  fi
+
+  # bash-preexec: atuin's hook into bash. Not packaged; one file, pinned to
+  # master like upstream's own instructions.
+  if [[ "$DEV_EXTRAS_UPGRADE" == "1" || ! -s "$CONF_DIR/bash-preexec.sh" ]]; then
+    curl -fsSL --max-time 30 -o "$CONF_DIR/bash-preexec.sh.new" \
+        https://raw.githubusercontent.com/rcaloras/bash-preexec/master/bash-preexec.sh \
+      && grep -q '__bp_install' "$CONF_DIR/bash-preexec.sh.new" \
+      && mv "$CONF_DIR/bash-preexec.sh.new" "$CONF_DIR/bash-preexec.sh" \
+      && sub "$(printf '%-11s' bash-preexec) fetched" \
+      || { rm -f "$CONF_DIR/bash-preexec.sh.new"; warn "could not fetch bash-preexec — atuin will not record history"; note_fail "bash-preexec"; }
+  fi
+
+  # trippy opens raw sockets; the capability saves running it under sudo.
+  if have trip; then
+    sudo setcap cap_net_raw+ep "$(command -v trip)" 2>/dev/null \
+      || sub "trip: could not set cap_net_raw — run it with sudo"
+  fi
+
+  # tealdeer needs its page cache before the first `tldr`.
+  have tldr && { tldr --update >/dev/null 2>&1 || warn "tldr: could not fetch the page cache"; }
+
+  # atuin: pull the existing bash history in once, so Ctrl-R is useful from
+  # the first shell rather than starting empty.
+  if have atuin && [[ ! -s "$HOME/.local/share/atuin/history.db" ]]; then
+    atuin import auto >/dev/null 2>&1 && sub "$(printf '%-11s' atuin) imported ~/.bash_history"
+  fi
+fi
+
+# ================================================================= docker ===
+# Docker's own repo first: it carries buildx and the compose plugin as current
+# releases, and tracks new Ubuntu versions within weeks. Until it does (or if
+# the repo is unreachable) Ubuntu's own docker.io + docker-compose-v2 serve —
+# same CLI, slightly older.
+if [[ "$SKIP_DOCKER" != "1" ]]; then
+  if have docker; then
+    log "Docker already present ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,))"
+  else
+    docker_done=0
+    log "Installing Docker"
+    if curl -fsI --max-time 20 \
+         "https://download.docker.com/linux/ubuntu/dists/${OS_CODE}/InRelease" >/dev/null 2>&1 \
+       && fetch_keys /etc/apt/keyrings/docker.asc https://download.docker.com/linux/ubuntu/gpg; then
+      if add_repo /etc/apt/sources.list.d/docker.sources \
+           "https://download.docker.com/linux/ubuntu" "$OS_CODE" stable \
+           /etc/apt/keyrings/docker.asc; then
+        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
+      fi
+      if apt_installable docker-ce; then
+        sub "docker-ce $(apt_cand docker-ce) from download.docker.com (${OS_CODE})"
+        soft "docker-ce" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+          && docker_done=1
+      else
+        warn "the Docker repo offers no docker-ce for ${OS_CODE} — removing it again"
+        sudo rm -f /etc/apt/sources.list.d/docker.sources
+        sudo apt-get update -qq >/dev/null 2>&1 || true
+      fi
+    else
+      sub "download.docker.com has no ${OS_CODE} suite yet"
+    fi
+    if (( ! docker_done )); then
+      sub "installing Ubuntu's docker.io ($(apt_cand docker.io)) with compose v2 and buildx"
+      soft "docker.io" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        docker.io docker-compose-v2 docker-buildx || true
+    fi
+  fi
+
+  if have docker; then
+    sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    if getent group docker >/dev/null 2>&1 && ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+      sudo usermod -aG docker "$USER" \
+        && warn "added ${USER} to the docker group — takes effect at the next login" \
+        || warn "could not add ${USER} to the docker group"
+    fi
+    # dive inspects image layers; lazydocker is a TUI over containers/compose.
+    gh_bin wagoodman/dive           "dive_.*_linux_${ARCH}\.deb$"                 dive
+    gh_bin jesseduffield/lazydocker "lazydocker_.*_Linux_${ARCH_RE}\.tar\.gz$"    lazydocker
   fi
 fi
 
@@ -851,7 +1068,7 @@ if [[ "$SKIP_LEGACY_CLEAN" != "1" ]]; then
     rm -rf "$f"; sub "removed stale $(hp "$f")"; legacy_cleaned=$((legacy_cleaned+1))
   done < <(find "$CONF_DIR" -mindepth 1 -maxdepth 1 \
              ! -name 'local*' ! -name rc.sh ! -name theme.sh ! -name completions \
-             ! -name start-dir 2>/dev/null)
+             ! -name start-dir ! -name bash-preexec.sh 2>/dev/null)
 
   (( legacy_cleaned == 0 )) && sub "nothing left over to clean"
 fi
@@ -1101,8 +1318,21 @@ export PAGER="less"
 export LESS="-R -F -i"
 export LESSHISTFILE="$HOME/.cache/less-history"
 export MANPAGER="less -R"
+# Coloured man pages through bat. col strips the overstrike bold/underline
+# that bat's man syntax does not expect; MANROFFOPT=-c keeps groff from
+# emitting the SGR escapes that would double-format it.
+if command -v batcat >/dev/null 2>&1 && command -v col >/dev/null 2>&1; then
+  export MANPAGER="sh -c 'col -bx | batcat -l man -p'"
+  export MANROFFOPT="-c"
+fi
 alias e='$EDITOR'
 alias sue='sudoedit'
+# neovim took over from vim; the muscle memory keeps working.
+if command -v nvim >/dev/null 2>&1; then
+  alias vim='nvim'
+  alias vi='nvim'
+  alias vimdiff='nvim -d'
+fi
 
 # ---- theme: Catppuccin Mocha ------------------------------------------------
 # micro checks MICRO_TRUECOLOR, not COLORTERM — without this it silently
@@ -1251,6 +1481,9 @@ alias gb='git branch -vv'
 alias gco='git checkout'
 alias gsw='git switch'
 alias gst='git stash'
+command -v lazygit >/dev/null 2>&1 && alias lg='lazygit'
+# git dft  = difftool through difftastic (structural diff); git dlog = log -p
+# with it. Set up in ~/.gitconfig by the bootstrap; these are just reminders.
 
 # ---- databases --------------------------------------------------------------
 # sqlcmd 18 defaults to encrypted connections; -C trusts self-signed dev certs.
@@ -1273,6 +1506,17 @@ dev() {
   tmux new-session -A -s "$name" -c "$dir"
 }
 
+# ---- docker -----------------------------------------------------------------
+if command -v docker >/dev/null 2>&1; then
+  alias d='docker'
+  alias dc='docker compose'
+  alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
+  alias dimg='docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"'
+  alias dlog='docker logs -f --tail 200'
+  alias dprune='docker system prune -f'
+  command -v lazydocker >/dev/null 2>&1 && alias lzd='lazydocker'
+fi
+
 # ---- python -----------------------------------------------------------------
 alias py='python3'
 alias venv='python3 -m venv .venv && source .venv/bin/activate'
@@ -1286,6 +1530,14 @@ command -v fdfind >/dev/null 2>&1 && alias fd='fdfind'
 command -v trash-put >/dev/null 2>&1 && alias trash='trash-put'
 command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init bash)"
 command -v direnv >/dev/null 2>&1 && eval "$(direnv hook bash)"
+# mise: per-project tool versions from .mise.toml / .tool-versions / .nvmrc.
+# Inert until a project pins something — the apt node and dotnet stay default.
+command -v mise >/dev/null 2>&1 && eval "$(mise activate bash)"
+# watchexec: `wx -e cs dotnet test`, `wx -r -- npm start`. It honours
+# .gitignore, which is what entr never did.
+command -v watchexec >/dev/null 2>&1 && alias wx='watchexec --clear'
+# trippy ships its binary as `trip`
+command -v trip >/dev/null 2>&1 && alias trippy='trip'
 
 # fzf: `fzf --bash` (0.48+) emits key bindings AND completion in one go and is
 # the only form upstream supports. The example files under /usr/share/doc are
@@ -1389,18 +1641,93 @@ mkvenv() {
   . .venv/bin/activate
 }
 
+# y — yazi, and the shell follows it: quitting with q leaves you in the folder
+# you navigated to (Q quits without changing directory).
+if command -v yazi >/dev/null 2>&1; then
+  y() {
+    local tmp cwd
+    tmp="$(mktemp -t yazi-cwd.XXXXXX)" || return 1
+    yazi "$@" --cwd-file="$tmp"
+    if cwd="$(command cat -- "$tmp" 2>/dev/null)" && [ -n "$cwd" ] && [ "$cwd" != "$PWD" ]; then
+      builtin cd -- "$cwd" || true
+    fi
+    rm -f -- "$tmp"
+  }
+fi
+
+# tshare user:password [port] — serve the "dev" tmux session in a browser
+# (ttyd). Credentials are required on purpose: it is a full shell. Reachable
+# on the LAN/VPN only, unless you opened the port in ufw yourself.
+tshare() {
+  command -v ttyd >/dev/null 2>&1 || { echo "tshare: ttyd is not installed" >&2; return 1; }
+  case "${1:-}" in *:*) ;; *) echo "usage: tshare user:password [port]" >&2; return 2 ;; esac
+  local port="${2:-7681}"
+  echo "http://$(hostname -I 2>/dev/null | awk '{print $1}'):${port}/  (Ctrl-C here to stop)"
+  ttyd -W -p "$port" -c "$1" tmux new-session -A -s dev
+}
+
+# ---- fastfetch on the first shell of a login --------------------------------
+# Once per login, not per pane: inside tmux only the server's very first pane
+# (%0) shows it, and a plain login shell only when tmux is not about to take
+# the screen anyway. DEV_FASTFETCH=0 in local.sh turns it off.
+__fastfetch_once() {
+  [ "${DEV_FASTFETCH:-1}" = "1" ]      || return
+  [ -z "${__DEV_FASTFETCH_SHOWN:-}" ]  || return   # `reload` must not repeat it
+  command -v fastfetch >/dev/null 2>&1 || return
+  case "$-" in *i*) ;; *) return ;; esac
+  if [ -n "${TMUX:-}" ]; then
+    [ "${TMUX_PANE:-}" = "%0" ] || return
+  else
+    shopt -q login_shell || return
+    if [ "${DEV_TMUX_AUTOSTART:-1}" = "1" ] && [ -z "${NO_TMUX:-}" ] \
+       && [ ! -f "$HOME/.no-auto-tmux" ] && command -v tmux >/dev/null 2>&1; then
+      return
+    fi
+  fi
+  __DEV_FASTFETCH_SHOWN=1
+  fastfetch
+}
+
+# ---- history: atuin -----------------------------------------------------------
+# atuin records every command into SQLite (with cwd, duration, exit code) and
+# owns Ctrl-R; fzf keeps Ctrl-T and Alt-C. It must come AFTER the fzf init so
+# its Ctrl-R binding wins, and it needs bash-preexec to see commands at all.
+# --disable-up-arrow keeps the prefix search on Up/Down from ~/.inputrc.
+# Guarded so that `reload` (re-sourcing this file) does not stack a second
+# copy of every hook.
+if command -v atuin >/dev/null 2>&1 && [ -r "$HOME/.config/dev-bootstrap/bash-preexec.sh" ] \
+   && ! declare -F __atuin_precmd >/dev/null 2>&1; then
+  . "$HOME/.config/dev-bootstrap/bash-preexec.sh"
+  eval "$(atuin init bash --disable-up-arrow)"
+fi
+
 # ---- prompt registration ----------------------------------------------------
-# Registered here, last, on purpose. zoxide and direnv both install their hooks
-# by *prepending* to PROMPT_COMMAND, so whichever hook is added last ends up at
-# the front of the chain. __prompt has to be at the front: its first statement
-# is `local ec=$?`, and if a zoxide/direnv hook ran ahead of it that $? would be
-# the hook's exit status (always 0) instead of the command you actually ran —
-# the red "$" on failure would never appear.
-case "${PROMPT_COMMAND:-}" in
-  *__prompt*) ;;                                        # already registered
-  "")         PROMPT_COMMAND="__prompt" ;;
-  *)          PROMPT_COMMAND="__prompt;$PROMPT_COMMAND" ;;
-esac
+# Registered here, last, on purpose. zoxide, direnv and mise all install their
+# hooks by *prepending* to PROMPT_COMMAND, so whichever hook is added last ends
+# up at the front of the chain — and the prompt has to be at the front, because
+# it reads $? first thing, and a hook running ahead of it would leave its own
+# exit status (always 0) there instead of the command's.
+#
+# starship draws the prompt when it is installed (DEV_PROMPT=bash in local.sh
+# picks the built-in one instead); its init handles the ordering itself. The
+# history flush moves out of __prompt so that it happens on either path.
+__hist_flush() { [ -n "${HISTFILE:-}" ] && history -a; }
+if command -v starship >/dev/null 2>&1 && [ "${DEV_PROMPT:-starship}" = "starship" ]; then
+  # Prepended, never appended: zoxide leaves a trailing ";" behind, and
+  # "...;;__hist_flush" is a syntax error on every single prompt.
+  case "${PROMPT_COMMAND:-}" in
+    *__hist_flush*) ;;
+    "")             PROMPT_COMMAND="__hist_flush" ;;
+    *)              PROMPT_COMMAND="__hist_flush;$PROMPT_COMMAND" ;;
+  esac
+  declare -F starship_precmd >/dev/null 2>&1 || eval "$(starship init bash)"
+else
+  case "${PROMPT_COMMAND:-}" in
+    *__prompt*) ;;                                        # already registered
+    "")         PROMPT_COMMAND="__prompt" ;;
+    *)          PROMPT_COMMAND="__prompt;$PROMPT_COMMAND" ;;
+  esac
+fi
 
 # ---- your own overrides -----------------------------------------------------
 # Sourced before the two things below that read DEV_START_DIR, so setting it in
@@ -1532,6 +1859,13 @@ if [[ "$SKIP_SHELL_CONF" != "1" ]]; then
   have just && gen_comp just just --completions bash
   have rg   && gen_comp rg   rg --generate complete-bash
   have pipx && gen_comp pipx bash -c 'register-python-argcomplete pipx'
+  have mise      && gen_comp mise      mise completion bash
+  have atuin     && gen_comp atuin     atuin gen-completions --shell bash
+  have starship  && gen_comp starship  starship completions bash
+  have watchexec && gen_comp watchexec watchexec --completions bash
+  have docker    && gen_comp docker    docker completion bash
+  have difft     && gen_comp difft     difft --generate-completions bash
+  have ya        && gen_comp ya        ya completions bash
   compgen -G "$COMP_DIR/*.bash" >/dev/null || sub "(none generated)"
 fi
 
@@ -1594,7 +1928,7 @@ fi
 
 # =========================================================== editor config ==
 if [[ "$SKIP_EDITOR_CONF" != "1" ]]; then
-  log "Configuring editors, bat theme and psql"
+  log "Configuring editors, bat theme, psql, starship, atuin, lazygit"
 
   # ----------------------------------------------------------- bat theme ----
   # bat has no built-in Catppuccin; fetch the .tmTheme and rebuild its cache.
@@ -1799,6 +2133,284 @@ MICROTHEME
 MICROSET
   fi
 
+  # ------------------------------------------------------------- neovim ----
+  # No plugin manager on purpose: nothing to clone on first start, nothing to
+  # break over ssh. Sane defaults, a built-in dark scheme, space as leader.
+  if have nvim; then
+    mkdir -p "$HOME/.config/nvim"
+    claim "$HOME/.config/nvim/init.lua" && cat > "$HOME/.config/nvim/init.lua" <<'NVIMRC'
+-- ~/.config/nvim/init.lua — managed by dev-bootstrap.sh
+-- Plugin-free defaults. Put your own additions in ~/.config/nvim/lua/local.lua
+vim.g.mapleader = " "
+vim.g.maplocalleader = " "
+local o = vim.opt
+o.number = true
+o.cursorline = true
+o.signcolumn = "yes"
+o.mouse = "a"
+o.clipboard = "unnamedplus"        -- xclip / wl-clipboard, or OSC 52 over ssh
+o.termguicolors = true
+o.expandtab = true
+o.shiftwidth = 4
+o.tabstop = 4
+o.smartindent = true
+o.ignorecase = true
+o.smartcase = true
+o.wrap = false
+o.scrolloff = 6
+o.splitright = true
+o.splitbelow = true
+o.undofile = true
+o.updatetime = 300
+o.list = true
+o.listchars = { tab = "» ", trail = "·", nbsp = "␣" }
+pcall(vim.cmd.colorscheme, "habamax")
+
+local map = vim.keymap.set
+map("n", "<Esc>", "<cmd>nohlsearch<CR>")
+map("n", "<leader>w", "<cmd>w<CR>", { desc = "save" })
+map("n", "<leader>q", "<cmd>q<CR>", { desc = "quit" })
+map("n", "<leader>e", "<cmd>Explore<CR>", { desc = "file browser" })
+map("n", "<C-h>", "<C-w>h"); map("n", "<C-j>", "<C-w>j")
+map("n", "<C-k>", "<C-w>k"); map("n", "<C-l>", "<C-w>l")
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "javascript", "typescript", "json", "yaml", "html", "css", "lua" },
+  callback = function() vim.bo.shiftwidth = 2; vim.bo.tabstop = 2 end,
+})
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "go", "make" },
+  callback = function() vim.bo.expandtab = false end,
+})
+pcall(require, "local")
+NVIMRC
+  fi
+
+  # ----------------------------------------------------------- starship ----
+  # The same Catppuccin Mocha as tmux/bat/delta, and no Nerd Font glyphs — a
+  # plain ssh terminal has none, and eza runs with --icons=never for the same
+  # reason. Layout mirrors the built-in prompt: user@host dir (branch*) / $.
+  if have starship; then
+    claim "$HOME/.config/starship.toml" && cat > "$HOME/.config/starship.toml" <<'STARSHIP'
+# ~/.config/starship.toml — managed by dev-bootstrap.sh
+"$schema" = 'https://starship.rs/config-schema.json'
+add_newline = false
+palette = "catppuccin_mocha"
+format = """
+$username$hostname$directory$git_branch$git_status$dotnet$nodejs$python$docker_context$cmd_duration$line_break$character"""
+
+[username]
+show_always = true
+style_user = "mauve"
+style_root = "bold red"
+format = "[$user]($style)"
+
+[hostname]
+ssh_only = false
+style = "overlay0"
+format = "[@$hostname]($style) "
+
+[directory]
+style = "blue"
+truncation_length = 4
+truncate_to_repo = true
+read_only = " ro"
+format = "[$path]($style)[$read_only]($read_only_style) "
+
+[git_branch]
+symbol = ""
+style = "peach"
+format = "[($branch)]($style)"
+
+[git_status]
+style = "peach"
+format = "[$all_status$ahead_behind]($style) "
+ahead = ">${count}"
+behind = "<${count}"
+diverged = "<>${ahead_count}/${behind_count}"
+conflicted = "!"
+modified = "*"
+staged = "+"
+untracked = "?"
+stashed = "\\$"
+deleted = "x"
+renamed = "r"
+
+[dotnet]
+symbol = ".NET "
+style = "mauve"
+heuristic = true
+format = "[$symbol($version)]($style) "
+
+[nodejs]
+symbol = "node "
+style = "green"
+format = "[$symbol($version)]($style) "
+
+[python]
+symbol = "py "
+style = "yellow"
+format = '[${symbol}${pyenv_prefix}(${version})(\($virtualenv\))]($style) '
+
+[docker_context]
+symbol = "docker "
+style = "sky"
+only_with_files = true
+format = "[$symbol$context]($style) "
+
+[cmd_duration]
+min_time = 2_000
+style = "yellow"
+format = "[$duration]($style) "
+
+[character]
+success_symbol = "[\\$](green)"
+error_symbol = "[\\$](red)"
+vimcmd_symbol = "[<](green)"
+
+[palettes.catppuccin_mocha]
+rosewater = "#f5e0dc"
+flamingo = "#f2cdcd"
+pink = "#f5c2e7"
+mauve = "#cba6f7"
+red = "#f38ba8"
+maroon = "#eba0ac"
+peach = "#fab387"
+yellow = "#f9e2af"
+green = "#a6e3a1"
+teal = "#94e2d5"
+sky = "#89dceb"
+sapphire = "#74c7ec"
+blue = "#89b4fa"
+lavender = "#b4befe"
+text = "#cdd6f4"
+subtext1 = "#bac2de"
+subtext0 = "#a6adc8"
+overlay2 = "#9399b2"
+overlay1 = "#7f849c"
+overlay0 = "#6c7086"
+surface2 = "#585b70"
+surface1 = "#45475a"
+surface0 = "#313244"
+base = "#1e1e2e"
+mantle = "#181825"
+crust = "#11111b"
+STARSHIP
+  fi
+
+  # -------------------------------------------------------------- atuin ----
+  # Local only: no account, no sync, no update nags. The filter list mirrors
+  # HISTIGNORE so the noise that is kept out of bash history stays out here.
+  if have atuin; then
+    mkdir -p "$HOME/.config/atuin"
+    claim "$HOME/.config/atuin/config.toml" && cat > "$HOME/.config/atuin/config.toml" <<'ATUIN'
+# ~/.config/atuin/config.toml — managed by dev-bootstrap.sh
+auto_sync = false
+update_check = false
+sync_frequency = "0"
+search_mode = "fuzzy"
+filter_mode = "host"
+style = "compact"
+inline_height = 25
+show_preview = true
+show_help = false
+enter_accept = false
+keymap_mode = "emacs"
+history_filter = [
+  "^ls$", "^ll$", "^la$", "^l$", "^cd$", "^cd -$", "^\\.\\.$", "^pwd$",
+  "^exit$", "^clear$", "^reload$", "^history$", "^gs$", "^h$",
+]
+cwd_filter = []
+ATUIN
+  fi
+
+  # ------------------------------------------------------------ lazygit ----
+  if have lazygit; then
+    lg_dir="$HOME/.config/lazygit"
+    mkdir -p "$lg_dir"
+    claim "$lg_dir/config.yml" && cat > "$lg_dir/config.yml" <<'LAZYGIT'
+# ~/.config/lazygit/config.yml — managed by dev-bootstrap.sh
+gui:
+  nerdFontsVersion: ""          # no Nerd Font over plain ssh
+  showFileTree: true
+  showRandomTip: false
+  border: rounded
+  theme:                        # Catppuccin Mocha
+    activeBorderColor:   ["#89b4fa", bold]
+    inactiveBorderColor: ["#a6adc8"]
+    optionsTextColor:    ["#89b4fa"]
+    selectedLineBgColor: ["#313244"]
+    cherryPickedCommitBgColor: ["#45475a"]
+    cherryPickedCommitFgColor: ["#89b4fa"]
+    unstagedChangesColor: ["#f38ba8"]
+    defaultFgColor:      ["#cdd6f4"]
+    searchingActiveBorderColor: ["#f9e2af"]
+  authorColors:
+    "*": "#b4befe"
+git:
+  paging:
+    colorArg: always
+    pager: delta --dark --paging=never --line-numbers
+  autoFetch: true
+  autoRefresh: true
+  branchLogCmd: git log --graph --color=always --abbrev-commit --decorate --date=relative --pretty=medium {{branchName}} --
+update:
+  method: never
+LAZYGIT
+  fi
+
+  # ----------------------------------------------------------- tealdeer ----
+  # Refresh the page cache by itself instead of nagging about its age.
+  if have tldr; then
+    mkdir -p "$HOME/.config/tealdeer"
+    claim "$HOME/.config/tealdeer/config.toml" && cat > "$HOME/.config/tealdeer/config.toml" <<'TLDR'
+# ~/.config/tealdeer/config.toml — managed by dev-bootstrap.sh
+[updates]
+auto_update = true
+auto_update_interval_hours = 168
+
+[style.command_name]
+foreground = "blue"
+bold = true
+[style.example_code]
+foreground = "green"
+[style.example_variable]
+foreground = "yellow"
+underline = true
+TLDR
+  fi
+
+  # ---------------------------------------------------------- fastfetch ----
+  # What matters on a server, nothing that needs a GPU or a display.
+  if have fastfetch; then
+    mkdir -p "$HOME/.config/fastfetch"
+    claim "$HOME/.config/fastfetch/config.jsonc" && cat > "$HOME/.config/fastfetch/config.jsonc" <<'FASTFETCH'
+// ~/.config/fastfetch/config.jsonc — managed by dev-bootstrap.sh
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": { "type": "small", "padding": { "top": 1, "right": 3 } },
+  "display": { "separator": "  ", "color": { "keys": "blue", "title": "magenta" } },
+  "modules": [
+    "title",
+    "separator",
+    "os",
+    "kernel",
+    "uptime",
+    "packages",
+    "shell",
+    "terminal",
+    "cpu",
+    "memory",
+    "swap",
+    { "type": "disk", "folders": "/" },
+    "localip",
+    "break",
+    "colors"
+  ]
+}
+FASTFETCH
+  fi
+
   # ---------------------------------------------------------------- psql ----
   claim "$HOME/.psqlrc" && cat > "$HOME/.psqlrc" <<'PSQLRC'
 -- ~/.psqlrc — managed by dev-bootstrap.sh
@@ -1849,7 +2461,8 @@ fi
 if [[ "$SKIP_SHELL_CONF" != "1" ]]; then
   cat >> "$CONF_DIR/rc.sh" <<'RCTAIL'
 
-# ---- tmux autostart ---------------------------------------------------------
+# ---- system summary, then tmux autostart ------------------------------------
+__fastfetch_once
 # Keep this last: __auto_tmux does not return, so later lines would never run.
 [ "${DEV_TMUX_AUTOSTART:-1}" = "1" ] && __auto_tmux
 RCTAIL
@@ -1936,6 +2549,18 @@ else
     git config --global --unset-all core.pager
   [[ "$(git config --global --get interactive.diffFilter 2>/dev/null)" == delta* ]] && \
     git config --global --unset-all interactive.diffFilter
+fi
+# difftastic: structural, syntax-aware diffs. Not the pager (delta stays the
+# default view) but one command away: `git dft` / `git dlog` / `git dshow`.
+if have difft; then
+  sub "difftastic available as git dft / dlog / dshow"
+  gitset diff.tool difftastic
+  gitset difftool.prompt false
+  gitset difftool.difftastic.cmd 'difft "$LOCAL" "$REMOTE"'
+  gitset pager.difftool true
+  gitset alias.dft  "difftool"
+  gitset alias.dlog "-c diff.external=difft log -p --ext-diff"
+  gitset alias.dshow "-c diff.external=difft show --ext-diff"
 fi
 # Identity, as collected at the top of the run (env > prompt > what git had).
 if [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]]; then
@@ -2259,6 +2884,95 @@ if [[ "$SKIP_SYSCTL" != "1" ]]; then
   fi
 fi
 
+# ============================================================== hardening ===
+# The three things a box with an SSH port deserves, kept deliberately modest:
+#   unattended-upgrades   security updates install themselves
+#   fail2ban              bans an IP after repeated failed SSH logins
+#   ufw                   deny incoming by default; SSH (and mosh) open from
+#                         everywhere, everything open from DEV_UFW_TRUST
+# The trusted ranges default to all of RFC 1918, so dev servers on :3000/:5000
+# stay reachable over a LAN or VPN and nothing here can lock you out. Docker
+# publishes ports through its own iptables chain and bypasses ufw entirely —
+# another reason the trusted-range model, not per-port rules, is the default.
+if [[ "$SKIP_HARDENING" != "1" ]]; then
+  log "Hardening: unattended-upgrades, fail2ban, ufw"
+  hard_pkgs=()
+  for p in unattended-upgrades fail2ban ufw; do
+    dpkg -s "$p" >/dev/null 2>&1 || { apt_has "$p" && hard_pkgs+=("$p"); }
+  done
+  (( ${#hard_pkgs[@]} )) && soft "hardening packages" sudo DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -qq --no-install-recommends "${hard_pkgs[@]}"
+
+  # ---- unattended-upgrades -------------------------------------------------
+  if dpkg -s unattended-upgrades >/dev/null 2>&1; then
+    printf '%s\n' \
+      "// ${MANAGED#\# }" \
+      'APT::Periodic::Update-Package-Lists "1";' \
+      'APT::Periodic::Unattended-Upgrade "1";' \
+      'APT::Periodic::AutocleanInterval "7";' \
+      | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+    sudo systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+    sub "unattended-upgrades: security updates daily (Ubuntu's default origins)"
+  fi
+
+  # ---- fail2ban ------------------------------------------------------------
+  # backend=systemd: Ubuntu ships no rsyslog any more, so /var/log/auth.log is
+  # often missing and the stock jail then refuses to start.
+  if dpkg -s fail2ban >/dev/null 2>&1; then
+    sudo tee /etc/fail2ban/jail.d/dev-bootstrap-sshd.local >/dev/null <<EOF
+${MANAGED}
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 ${DEV_UFW_TRUST}
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+backend = systemd
+EOF
+    sudo systemctl enable fail2ban >/dev/null 2>&1 || true
+    if sudo systemctl restart fail2ban >/dev/null 2>&1; then
+      sub "fail2ban: sshd jail on, 5 failures in 10 min = 1 h ban (trusted ranges ignored)"
+    else
+      warn "fail2ban did not start — journalctl -u fail2ban"; note_fail "fail2ban"
+    fi
+  fi
+
+  # ---- ufw -----------------------------------------------------------------
+  # SSH is allowed BEFORE the firewall is enabled, on whatever port sshd is
+  # really listening on, and enabling is skipped if that rule could not be
+  # added. `ufw allow` is idempotent, so a re-run only reports existing rules.
+  if have ufw; then
+    ssh_ports="$(sudo sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ')"
+    [[ -z "$ssh_ports" ]] && ssh_ports="22 "
+    ufw_ok=1
+    for p in $ssh_ports; do
+      sudo ufw allow "${p}/tcp" comment 'ssh' >/dev/null 2>&1 || ufw_ok=0
+    done
+    have mosh && sudo ufw allow 60000:61000/udp comment 'mosh' >/dev/null 2>&1
+    for net in $DEV_UFW_TRUST; do
+      sudo ufw allow from "$net" comment 'trusted (dev-bootstrap)' >/dev/null 2>&1 \
+        || warn "ufw: could not add the trusted range ${net}"
+    done
+    if (( ufw_ok )); then
+      if sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
+        sub "ufw: already active — rules refreshed (ssh ${ssh_ports}tcp, trusted: ${DEV_UFW_TRUST})"
+      else
+        sudo ufw default deny incoming  >/dev/null 2>&1
+        sudo ufw default allow outgoing >/dev/null 2>&1
+        if sudo ufw --force enable >/dev/null 2>&1; then
+          sub "ufw: enabled — incoming denied except ssh (${ssh_ports}tcp) and the trusted ranges"
+        else
+          warn "ufw could not be enabled"; note_fail "ufw"
+        fi
+      fi
+    else
+      warn "ufw: the ssh rule could not be added — NOT enabling the firewall"; note_fail "ufw"
+    fi
+  fi
+fi
+
 # ====================================================== shared dev folder ===
 if [[ -d "$DEV_ROOT" ]] && getent group "$DEV_GROUP" >/dev/null 2>&1; then
   if ! id -nG "$USER" | tr ' ' '\n' | grep -qx "$DEV_GROUP"; then
@@ -2340,6 +3054,15 @@ ver delta    "$(delta --version 2>/dev/null | awk '{print $2}')"
 ver rg       "$(rg --version 2>/dev/null | awk 'NR==1{print $2}')"
 ver fzf      "$(fzf --version 2>/dev/null | awk '{print $1}')"
 ver gh       "$(gh --version 2>/dev/null | awk 'NR==1{print $3}')"
+ver nvim     "$(nvim --version 2>/dev/null | awk 'NR==1{print $2}')"
+ver docker   "$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)"
+ver lazygit  "$(lazygit --version 2>/dev/null | grep -oE 'version=[^,]+' | cut -d= -f2)"
+ver starship "$(starship --version 2>/dev/null | awk 'NR==1{print $2}')"
+ver atuin    "$(atuin --version 2>/dev/null | awk '{print $2}')"
+ver mise     "$(mise --version 2>/dev/null | awk '{print $1}')"
+ver watchexec "$(watchexec --version 2>/dev/null | awk '{print $2}')"
+ver yazi     "$(yazi --version 2>/dev/null | awk '{print $2}')"
+ver ufw      "$(sudo ufw status 2>/dev/null | awk '/^Status/{print tolower($2)}')"
 
 if (( ${#ADOPTED[@]} )); then
   echo
@@ -2359,6 +3082,8 @@ sub "exec bash -l                 # pick up PATH, theme, aliases"
 sub "ll                           # long listing (also: la lt lt3 ltr lsz ldot)"
 sub "claude                       # authenticate once; 'cc' is the shortcut"
 sub "touch ~/.no-auto-tmux        # if you don't want tmux on login"
+sub "lg / y / lzd / tldr <cmd>     # lazygit, yazi, lazydocker, quick examples"
+sub "Ctrl-R                       # atuin history search (fzf keeps Ctrl-T, Alt-C)"
 sub "DEV_START_DIR=/path bash $0  # change where logins start"
 sub "\$EDITOR ~/.config/dev-bootstrap/local.sh   # your own aliases, never overwritten"
 sub "ls ~/.*.pre-bootstrap        # the config you had before the first run"

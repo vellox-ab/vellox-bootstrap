@@ -37,6 +37,7 @@ variables:
 ```bash
 SKIP_MSSQL=1 bash dev-bootstrap.sh
 DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
+DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
 ```
 
 | Variable | Default | Meaning |
@@ -47,18 +48,20 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 | `DOTNET_MAJOR` | empty | Pin an SDK major; empty takes the newest the distro has |
 | `DOTNET_TOOLS` | `csharp-ls dotnet-ef` | .NET global tools to install |
 | `PG_MAJOR` | `18` | Preferred PGDG client major version |
-| `DEV_EDITOR` | `nano` | `nano`, `micro` or `vim` |
+| `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
 | `DEV_START_DIR` | asked for | Folder every login starts in; setting it skips the prompt |
 | `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
+| `DEV_UFW_TRUST` | `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16` | Networks ufw allows outright and fail2ban never bans |
+| `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads the tools that come from GitHub releases |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
-`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
-`SKIP_EDITOR_CONF`, `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
-`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set
-any of them to `1`.
+`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`, `SKIP_HARDENING`,
+`SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`,
+`SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`, `SKIP_CLAUDE_CONF`,
+`SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set any of them to `1`.
 
 ### Git identity
 
@@ -120,15 +123,44 @@ re-run at all.
 ## What it installs and configures
 
 - **System packages** — build toolchain, `git`/`git-lfs`/`gh`/`git-delta`,
-  archive tools, `tmux`, editors (`vim`, `nano`, `micro`), modern CLI tools
+  archive tools, `tmux`, editors (`neovim`, `nano`, `micro`), modern CLI tools
   (`ripgrep`, `fd`, `fzf`, `bat`, `eza`, `zoxide`, `direnv`, `jq`, `yq`, `just`,
-  `dust`, `duf`, `btop`, `hyperfine`, `tokei`, …), networking and diagnostic
-  tools, `sqlite3`, `shellcheck`, `shfmt`, ODBC and build headers.
+  `dust`, `duf`, `btop`, `procs`, `hyperfine`, `tokei`, `tldr`, …), networking
+  and diagnostic tools (`mosh`, `gping`, `trippy`, `lnav`, `ttyd`, `age`),
+  `sqlite3`, `shellcheck`, `shfmt`, ODBC and build headers.
+- **Extra tools** — the ones apt does not have on every release, installed from
+  apt where it does (26.04 carries most of them) and from the project's latest
+  GitHub release otherwise — a `.deb` through apt when one is published, a
+  binary in `~/.local/bin` if not:
+  - `lazygit` (`lg`) with a Catppuccin config and delta as its pager
+  - `starship` as the prompt, same palette and layout as the built-in one, no
+    Nerd Font glyphs (`DEV_PROMPT=bash` in `local.sh` brings the old one back)
+  - `atuin` for shell history — SQLite, fuzzy **Ctrl-R**, your existing
+    `~/.bash_history` imported once; local only, no sync account. fzf keeps
+    Ctrl-T and Alt-C, and Up/Down keep the prefix search from `~/.inputrc`
+  - `mise` for per-project tool versions (`.mise.toml`, `.nvmrc`, …); inert
+    until a project pins something, so the apt Node and .NET stay the defaults
+  - `watchexec` (`wx`) instead of `entr` — recursive and `.gitignore`-aware
+  - `difftastic` as `git dft` / `git dlog` / `git dshow`; delta stays the pager
+  - `yazi` (`y`, the shell follows it), `jless`, `croc`, `sops`, `onefetch`,
+    `fastfetch` (shown once per login, `DEV_FASTFETCH=0` turns it off),
+    `harlequin` (TUI SQL IDE, Postgres + ODBC adapters), `ast-grep`
+- **Docker** — `docker-ce` with buildx and the compose plugin from Docker's own
+  repo, or Ubuntu's `docker.io` + `docker-compose-v2` while that repo has no
+  suite for the release yet; you are added to the `docker` group. Plus
+  `lazydocker` (`lzd`) and `dive`.
+- **Hardening** — `unattended-upgrades` for security updates, `fail2ban` on
+  sshd (systemd backend, trusted ranges ignored), and `ufw` with incoming
+  denied by default — SSH (on whatever port sshd really listens on) and mosh
+  open from everywhere, everything open from `DEV_UFW_TRUST`. That defaults to
+  all of RFC 1918, so a box reached over a LAN or VPN keeps its dev ports and
+  the firewall cannot lock you out. The SSH rule is added *before* the
+  firewall is enabled, and enabling is skipped if that rule failed.
 - **Node.js** — from NodeSource when the distro version is older than
   `NODE_MAJOR`.
 - **Python** — `python3` with `venv`/`pip`/`dev`, `pipx`, `uv`, and the pipx
-  tools `ruff`, `black`, `isort`, `ipython`, `httpie`, `sqlfluff`, `pre-commit`
-  and `pgcli`.
+  tools `ruff`, `black`, `isort`, `ipython`, `httpie`, `sqlfluff`, `pre-commit`,
+  `pgcli` and `harlequin`.
 - **.NET** — the SDK from Ubuntu itself (26.04 → 10.0, 24.04 → 8.0); if the
   release carries none, Microsoft's official installer puts a private copy in
   `~/.dotnet`. Global tools from `DOTNET_TOOLS` land in `~/.dotnet/tools`:
@@ -165,15 +197,18 @@ re-run at all.
   and navigation, applied to a running server as well as to new ones (see
   [Existing config on the machine](#existing-config-on-the-machine)).
 - **Shell** — `~/.config/dev-bootstrap/rc.sh` with PATH, truecolor, a shared-dev
-  umask, history tuning, a git-aware Catppuccin prompt, aliases for listing,
-  git, databases, tmux, Python and misc tools, and the start folder every login
-  lands in. Your own overrides live in
+  umask, history tuning, the starship prompt (with the git-aware Catppuccin
+  bash prompt as fallback), coloured man pages through bat, aliases for
+  listing, git, docker, databases, tmux, Python and misc tools, and the start
+  folder every login lands in. Your own overrides live in
   `~/.config/dev-bootstrap/local.sh` and are never overwritten.
 - **Completions and `inputrc`** — history search on the arrow keys, word-wise
   movement, working Home/End in every terminal flavour.
-- **Editor config** — for whichever `DEV_EDITOR` you chose.
+- **Editor and tool config** — nano, micro and a plugin-free neovim
+  `init.lua`, plus `starship.toml`, atuin, lazygit, tealdeer and fastfetch
+  configs — all Catppuccin Mocha, all written whole and backed up once.
 - **git config** — the identity you are asked for, global defaults, `delta` as
-  the pager, `tag.sort=version:refname`.
+  the pager, `difftastic` as the difftool, `tag.sort=version:refname`.
 - **Microsoft SQL tooling** — `sqlcmd` / `bcp` (`mssql-tools18`) and the
   `msodbcsql18` ODBC driver. Microsoft publishes no SQL packages for 26.04
   (resolute), so the script probes their repos live and installs the newest
@@ -195,8 +230,9 @@ written, the script clears out what would fight it. `SKIP_LEGACY_CLEAN=1` turns
 all of it off.
 
 - **The files it writes, it owns.** `~/.tmux.conf`, `~/.inputrc`, `~/.nanorc`,
-  `~/.psqlrc`, `~/.gitignore_global`, the micro config and
-  `~/.claude/statusline.sh` are written whole, so a re-run always lands on the
+  `~/.psqlrc`, `~/.gitignore_global`, the micro, neovim, starship, atuin,
+  lazygit, tealdeer and fastfetch configs and `~/.claude/statusline.sh` are
+  written whole, so a re-run always lands on the
   same content. What was there before the *first* run is kept as
   `<file>.pre-bootstrap`, once — a later run never overwrites that copy with
   one of our own generated files. The exception stays the exception:
@@ -246,4 +282,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.6.0** (see `VERSION`).
+Current version: **5.7.0** (see `VERSION`).
