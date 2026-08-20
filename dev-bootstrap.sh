@@ -20,6 +20,21 @@
 #   SKIP_MSSQL=1 bash dev-bootstrap.sh     # skip a section
 #   DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 #
+# Config files (~/.tmux.conf, ~/.inputrc, ~/.nanorc, ~/.psqlrc, the micro and
+# Claude Code files) are written WHOLE — they belong to this script. What was
+# there before the first run is kept once, forever, as <file>.pre-bootstrap; a
+# symlink in their place is removed rather than written through; and settings
+# from an earlier setup that would fight this one are cleared out first:
+#
+#   * dev-bootstrap blocks left in shell startup files by older runs
+#   * a hand-rolled tmux autostart, which would stop this config from loading
+#     at all (commented out, with the file backed up)
+#   * options and key bindings still live in a RUNNING tmux server: sourcing a
+#     config never unsets anything, so the server is put back to stock first
+#
+#   SKIP_LEGACY_CLEAN=1 bash dev-bootstrap.sh   # leave all of the above alone
+#   DEV_TMUX_RESET=0    bash dev-bootstrap.sh   # never touch a running server
+#
 # The global git identity (user.name / user.email) is asked for interactively
 # near the start of the run. To answer it up front instead:
 #
@@ -59,12 +74,15 @@ SKIP_SYSCTL="${SKIP_SYSCTL:-0}"
 SKIP_GIT_CONF="${SKIP_GIT_CONF:-0}"
 SKIP_GIT_IDENTITY="${SKIP_GIT_IDENTITY:-0}"
 SKIP_INPUTRC="${SKIP_INPUTRC:-0}"
+SKIP_LEGACY_CLEAN="${SKIP_LEGACY_CLEAN:-0}"   # 1 = leave old config in place
+DEV_TMUX_RESET="${DEV_TMUX_RESET:-1}"         # 0 = do not touch a running server
 CLEAN_ONLY=0
 
 CONF_DIR="$HOME/.config/dev-bootstrap"
 MARKER="# >>> dev-bootstrap >>>"
 MARKER_END="# <<< dev-bootstrap <<<"
 MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
+BACKUP_SUFFIX=".pre-bootstrap"
 
 for arg in "$@"; do
   case "$arg" in
@@ -105,6 +123,72 @@ soft() {                       # soft <label> <command...>
   return 0
 }
 note_fail() { FAILED_STEPS+=("$1"); }
+hp() { printf '%s' "${1/#$HOME/\~}"; }          # print a path as ~/...
+
+# ------------------------------------------------------- taking a file over --
+# Every dotfile below is written WHOLE: the file belongs to this script, and a
+# re-run has to land on exactly the same content no matter what was there
+# first. Two things must survive that:
+#   * the version you had before the very first run — kept once, forever, as
+#     <file>.pre-bootstrap, and never overwritten by a later run
+#   * a file that is not really a file: a symlink from a dotfile manager
+#     (stow, chezmoi, oh-my-tmux) is written THROUGH by `cat >`, silently
+#     rewriting whatever it points at somewhere else
+ADOPTED=()                     # what was moved aside, printed in the summary
+
+# claim <path> — make <path> safe to overwrite. Non-zero means "do not write".
+claim() {
+  local f="$1" tgt
+  if [[ -L "$f" ]]; then
+    tgt="$(readlink "$f")"
+    rm -f "$f"
+    warn "$(hp "$f") was a symlink to $(hp "$tgt") — replaced with a real file"
+    sub "$(hp "$tgt") itself is untouched; re-link it by hand if you want it back"
+    ADOPTED+=("$(hp "$f") — symlink to $(hp "$tgt") removed")
+    return 0
+  fi
+  [[ -e "$f" ]] || return 0
+  if [[ -d "$f" ]]; then
+    warn "$(hp "$f") is a directory, not a file — skipped"
+    note_fail "$(hp "$f") is a directory"; return 1
+  fi
+  if lsattr -d "$f" 2>/dev/null | awk '{print $1}' | grep -q i; then
+    warn "$(hp "$f") is immutable (chattr +i) — left alone"
+    note_fail "$(hp "$f") is immutable"; return 1
+  fi
+  if [[ ! -w "$f" ]]; then
+    warn "$(hp "$f") is not writable — left alone"
+    note_fail "$(hp "$f") is not writable"; return 1
+  fi
+  # Only ever back up something we did not write ourselves, and only when no
+  # backup exists yet — otherwise run two would replace your original with a
+  # copy of our own generated file.
+  if [[ ! -e "${f}${BACKUP_SUFFIX}" ]] && ! grep -qs "dev-bootstrap" "$f"; then
+    cp -p "$f" "${f}${BACKUP_SUFFIX}"
+    sub "kept your old $(basename "$f") as $(basename "$f")${BACKUP_SUFFIX}"
+    ADOPTED+=("$(hp "$f") — backed up to $(basename "$f")${BACKUP_SUFFIX}")
+  fi
+  return 0
+}
+
+# strip_block <file> — remove every dev-bootstrap block, not just the first.
+# sed restarts the range after each end marker, so duplicates left by older
+# runs (or by a version of this script that hooked a different file) all go.
+strip_block() {
+  [[ -f "$1" ]] || return 0
+  grep -qF "$MARKER" "$1" || return 0
+  sed -i "/$(printf '%s' "$MARKER" | sed 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$MARKER_END" | sed 's/[][\.*^$/]/\\&/g')/d" "$1"
+}
+
+# login_rc_path — the ONE file a login shell reads: bash takes the first of
+# these that exists and never looks at the others.
+login_rc_path() {
+  local f
+  for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
 
 apt_has()  { apt-cache show "$1" >/dev/null 2>&1; }
 apt_cand() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}'; }
@@ -480,7 +564,7 @@ if [[ "$SKIP_CLAUDE_CONF" != "1" ]] && have claude; then
   # ---- status line ---------------------------------------------------------
   # Catppuccin Mocha, to match tmux/bat/delta/fzf. The session JSON arrives on
   # stdin; every field is optional, so each one is guarded.
-  cat > "$HOME/.claude/statusline.sh" <<'STATUSLINE'
+  claim "$HOME/.claude/statusline.sh" && cat > "$HOME/.claude/statusline.sh" <<'STATUSLINE'
 #!/usr/bin/env bash
 # ~/.claude/statusline.sh — managed by dev-bootstrap.sh, regenerated on re-run.
 # Renders: Opus · project · branch* · 38% ctx · $0.42
@@ -596,12 +680,169 @@ STATUSLINE
   done
 fi
 
+# ======================================================= old shell config ===
+# Writing our own files is not enough on a machine that has been set up before:
+# what was already there keeps running. Three kinds of leftover actually bite,
+# and they are dealt with here, before anything new is written.
+#
+#   1. a stale "# >>> dev-bootstrap >>>" block in a startup file this run no
+#      longer hooks — it would source an rc.sh a second time, or one that is
+#      no longer there
+#   2. a tmux autostart of your own. `exec tmux` replaces the shell and
+#      `tmux attach` blocks until you detach, so in both cases every line
+#      after it — including the block that loads all of this — never runs
+#   3. settings pointed somewhere else entirely by the environment. Those can
+#      only be reported: they are not in this user's shell files.
+#
+# SKIP_LEGACY_CLEAN=1 turns the whole section off and leaves everything as is.
+LOGIN_HAD_OURS=0
+if [[ "$SKIP_LEGACY_CLEAN" != "1" ]]; then
+  log "Clearing settings from earlier setups that would fight this one"
+  legacy_cleaned=0
+  RC_FILES=("$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login"
+            "$HOME/.profile" "$HOME/.bash_aliases")
+
+  # ---- 1. our own blocks, wherever they ended up ---------------------------
+  # Only when the shell config is actually being rewritten: stripping the block
+  # under SKIP_SHELL_CONF=1 would leave the shell with nothing at all.
+  if [[ "$SKIP_SHELL_CONF" != "1" ]]; then
+    for f in "${RC_FILES[@]}"; do
+      grep -qsF "$MARKER" "$f" || continue
+      [[ "$f" != "$HOME/.bashrc" ]] && LOGIN_HAD_OURS=1
+      strip_block "$f"
+      sub "removed the old dev-bootstrap block from $(hp "$f")"
+      legacy_cleaned=$((legacy_cleaned+1))
+    done
+  fi
+
+  # ---- 2. a competing tmux autostart ---------------------------------------
+  # Left alone when our own autostart is off (DEV_TMUX_AUTOSTART=0) — with
+  # nothing to compete with, yours is simply the one that runs.
+  # Matched narrowly: an `exec tmux`, or a bare `tmux attach|new|new-session`
+  # command. Aliases and function bodies (which is where `alias ta='tmux
+  # attach -t'` lives) are skipped, and so is anything already commented out.
+  if [[ "$DEV_TMUX_AUTOSTART" == "1" ]]; then
+    for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+      [[ -f "$f" ]] || continue
+      tmux_lines="$(grep -nE '^[[:space:]]*[^#]*\btmux\b' "$f" 2>/dev/null \
+        | grep -vE '\balias\b|\bfunction\b|\(\)|dev-bootstrap|__auto_tmux' \
+        | grep -E '\bexec[[:space:]]+tmux\b|\btmux\b([[:space:]]+-[^[:space:]]+)*[[:space:]]+(a|at|att|attach|attach-session|new|new-session)\b' \
+        | cut -d: -f1)"
+      [[ -z "$tmux_lines" ]] && continue
+      claim "$f" || continue
+      while read -r ln; do
+        [[ -n "$ln" ]] || continue
+        sub "$(hp "$f") line ${ln}: $(sed -n "${ln}p" "$f" | sed 's/^[[:space:]]*//')"
+        sed -i "${ln}s|^|# disabled by dev-bootstrap (competing tmux autostart): |" "$f"
+      done <<< "$tmux_lines"
+      warn "commented out a tmux autostart of your own in $(hp "$f")"
+      sub "ours takes over: session \"dev\", with the opt-outs listed at the end"
+      sub "to keep yours instead: DEV_TMUX_AUTOSTART=0, and restore the lines above"
+      ADOPTED+=("$(hp "$f") — your tmux autostart commented out")
+      legacy_cleaned=$((legacy_cleaned+1))
+    done
+  fi
+
+  # ---- 3. what cannot be overwritten from here -----------------------------
+  if [[ -n "${INPUTRC:-}" && "${INPUTRC}" != "$HOME/.inputrc" ]]; then
+    warn "INPUTRC=${INPUTRC} — readline reads that file and ignores ~/.inputrc"
+    sub "it comes from outside this shell (/etc/environment, PAM, the SSH client)"
+  fi
+  if [[ -n "${GIT_CONFIG_GLOBAL:-}" ]]; then
+    warn "GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL} — the git settings below go there"
+  fi
+  if [[ -f "$HOME/.gitconfig" && -f "$HOME/.config/git/config" ]]; then
+    warn "both ~/.gitconfig and ~/.config/git/config exist — git reads both"
+    sub "we write to ~/.gitconfig, which is read last and therefore wins"
+  fi
+  [[ -f /etc/tmux.conf ]] && \
+    sub "/etc/tmux.conf is system-wide and read first — ~/.tmux.conf overrides it"
+  if [[ -d "$HOME/.tmux/plugins/tpm" ]]; then
+    warn "the tmux plugin manager is installed but nothing loads it any more"
+    sub "the new ~/.tmux.conf has no TPM line — the plugins just sit there"
+    sub "rm -rf ~/.tmux/plugins to be done with them"
+  fi
+  [[ -e "$HOME/.tmux.conf.local" ]] && \
+    sub "found ~/.tmux.conf.local (oh-my-tmux) — nothing reads it any more"
+  [[ -f "$HOME/.bash_aliases" ]] && \
+    sub "your ~/.bash_aliases still loads, and earlier than ours — ours win on a clash"
+
+  # ---- 4. our own generated files that no longer belong to any section -----
+  # rc.sh, theme.sh and completions/ are regenerated below, so whatever else is
+  # in there came from an older version of this script and is now dead weight:
+  # nothing sources it any more. Anything called local* is yours and stays.
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    rm -rf "$f"; sub "removed stale $(hp "$f")"; legacy_cleaned=$((legacy_cleaned+1))
+  done < <(find "$CONF_DIR" -mindepth 1 -maxdepth 1 \
+             ! -name 'local*' ! -name rc.sh ! -name theme.sh ! -name completions 2>/dev/null)
+
+  (( legacy_cleaned == 0 )) && sub "nothing left over to clean"
+fi
+
 # ============================================================== tmux.conf ===
+# tmux_reload — hand the new config to a server that is ALREADY running.
+#
+# Sourcing a config never *un*sets anything. Every option and every key binding
+# from the config that was in force when the server started is still in force
+# afterwards, so an old ~/.tmux.conf keeps its bindings until the last session
+# dies — the classic "I rewrote tmux.conf and half of it did nothing".
+#
+# So: put the running server back to stock first, then apply ours on top.
+#   options — `set -u` on a global option restores its built-in default
+#   bindings — there is no "reset keys" command, so the defaults are read out
+#              of a throwaway server started with -f /dev/null. list-keys
+#              prints exactly the bind-key commands that recreate them, which
+#              means the output can be sourced straight back in.
+# Any of that failing is not fatal: the config is on disk either way, and a
+# fresh server (or `tmux kill-server`) always starts clean.
+tmux_reload() {
+  tmux info &>/dev/null || return 0        # no server: nothing stale to clear
+  if [[ "$DEV_TMUX_RESET" != "1" ]]; then
+    tmux source-file "$HOME/.tmux.conf" 2>/dev/null || true
+    return 0
+  fi
+  local scope id o keys t
+  for scope in -g -gw; do
+    tmux show-options $scope 2>/dev/null | cut -d' ' -f1 | cut -d'[' -f1 | sort -u \
+      | while read -r o; do [[ -n "$o" ]] && tmux set $scope -u "$o" 2>/dev/null; done
+  done
+  # Session- and window-local values shadow the globals we just reset.
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    tmux show-options -t "$id" 2>/dev/null | cut -d' ' -f1 | cut -d'[' -f1 \
+      | while read -r o; do [[ -n "$o" ]] && tmux set -t "$id" -u "$o" 2>/dev/null; done
+  done < <(tmux list-sessions -F '#{session_id}' 2>/dev/null)
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    tmux show-options -w -t "$id" 2>/dev/null | cut -d' ' -f1 | cut -d'[' -f1 \
+      | while read -r o; do [[ -n "$o" ]] && tmux set -w -t "$id" -u "$o" 2>/dev/null; done
+  done < <(tmux list-windows -a -F '#{window_id}' 2>/dev/null)
+
+  keys="$(mktemp)"
+  if tmux -L dev-bootstrap-probe -f /dev/null start-server \; list-keys >"$keys" 2>/dev/null \
+     && [[ -s "$keys" ]]; then
+    tmux -L dev-bootstrap-probe kill-server 2>/dev/null
+    for t in prefix root copy-mode copy-mode-vi; do tmux unbind -a -T "$t" 2>/dev/null; done
+    tmux source-file "$keys" 2>/dev/null \
+      || warn "could not put the default tmux key bindings back — tmux kill-server will"
+  else
+    tmux -L dev-bootstrap-probe kill-server 2>/dev/null
+    warn "could not read tmux's default key bindings"
+    sub "bindings from your old config may survive until \`tmux kill-server\`"
+  fi
+  rm -f "$keys"
+  if tmux source-file "$HOME/.tmux.conf" 2>/dev/null; then
+    sub "reloaded the running tmux server (old options and bindings cleared)"
+  else
+    warn "the running tmux server did not accept the new config"
+    note_fail "tmux reload"
+  fi
+}
+
 if [[ "$SKIP_TMUX_CONF" != "1" ]]; then
   log "Writing ~/.tmux.conf"
-  [[ -f "$HOME/.tmux.conf" && ! -f "$HOME/.tmux.conf.pre-bootstrap" ]] && \
-    cp "$HOME/.tmux.conf" "$HOME/.tmux.conf.pre-bootstrap"
-  cat > "$HOME/.tmux.conf" <<'TMUXCONF'
+  claim "$HOME/.tmux.conf" && cat > "$HOME/.tmux.conf" <<'TMUXCONF'
 # ~/.tmux.conf — managed by dev-bootstrap.sh
 # Theme: Catppuccin Mocha
 
@@ -697,7 +938,7 @@ set -g display-panes-active-colour "#89b4fa"
 set -g display-panes-colour "#6c7086"
 set -g clock-mode-colour "#89b4fa"
 TMUXCONF
-  tmux info &>/dev/null && tmux source-file "$HOME/.tmux.conf" 2>/dev/null || true
+  tmux_reload
 fi
 
 # ============================================================ shell config ==
@@ -1116,13 +1357,9 @@ __auto_tmux() {
 # at the very end of the script — see "rc.sh tail" — because it never returns.
 RCFILE
 
-  # Hook into .bashrc exactly once, replacing any previous block.
+  # Hook into .bashrc exactly once, replacing any previous block. The "old
+  # shell config" section above already stripped these, unless it was skipped.
   touch "$HOME/.bashrc"
-  strip_block() {                       # strip_block <file>
-    [[ -f "$1" ]] || return 0
-    grep -qF "$MARKER" "$1" || return 0
-    sed -i "/$(printf '%s' "$MARKER" | sed 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$MARKER_END" | sed 's/[][\.*^$/]/\\&/g')/d" "$1"
-  }
   strip_block "$HOME/.bashrc"
   {
     echo "$MARKER"
@@ -1139,18 +1376,10 @@ RCFILE
   # sources ~/.bashrc itself the login shell gets NO aliases, NO prompt and NO
   # PATH from this bootstrap. That failure is silent and very easy to misread
   # as "the script didn't install anything".
-  login_rc=""
-  for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
-    [[ -f "$f" ]] && { login_rc="$f"; break; }
-  done
-  if [[ -z "$login_rc" ]]; then
-    login_rc="$HOME/.bash_profile"
-    touch "$login_rc"
-  fi
-  # Record whether OUR block was already there before stripping it, so a re-run
+  login_rc="$(login_rc_path)" || { login_rc="$HOME/.bash_profile"; touch "$login_rc"; }
+  # LOGIN_HAD_OURS was recorded before the blocks were stripped, so a re-run
   # reports "refreshed" instead of re-raising the first-run warning every time.
-  login_had_ours=0
-  grep -qF "$MARKER" "$login_rc" 2>/dev/null && login_had_ours=1
+  grep -qF "$MARKER" "$login_rc" 2>/dev/null && LOGIN_HAD_OURS=1
   strip_block "$login_rc"
   if grep -qE '^[^#]*(\.|source)[[:space:]]+.*\.bashrc' "$login_rc"; then
     sub "$(basename "$login_rc") already sources ~/.bashrc"
@@ -1163,7 +1392,7 @@ RCFILE
       echo '[ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
       echo "$MARKER_END"
     } >> "$login_rc"
-    if (( login_had_ours )); then
+    if (( LOGIN_HAD_OURS )); then
       sub "$(basename "$login_rc") -> ~/.bashrc bridge refreshed"
     else
       warn "$(basename "$login_rc") did not source ~/.bashrc — added it"
@@ -1212,9 +1441,7 @@ fi
 # on a bare Ubuntu box and costs nothing at runtime.
 if [[ "$SKIP_INPUTRC" != "1" ]]; then
   log "Writing ~/.inputrc"
-  [[ -f "$HOME/.inputrc" && ! -f "$HOME/.inputrc.pre-bootstrap" ]] && \
-    cp "$HOME/.inputrc" "$HOME/.inputrc.pre-bootstrap"
-  cat > "$HOME/.inputrc" <<'INPUTRC'
+  claim "$HOME/.inputrc" && cat > "$HOME/.inputrc" <<'INPUTRC'
 # ~/.inputrc — managed by dev-bootstrap.sh
 $include /etc/inputrc
 
@@ -1298,9 +1525,7 @@ if [[ "$SKIP_EDITOR_CONF" != "1" ]]; then
   # nano accepts #rgb (12-bit) on any 256-colour terminal but rejects #rrggbb
   # unless TERM advertises direct colour — under tmux-256color a hex-heavy
   # nanorc errors on every launch. These are Catppuccin rounded to 12-bit.
-  [[ -f "$HOME/.nanorc" && ! -f "$HOME/.nanorc.pre-bootstrap" ]] && \
-    cp "$HOME/.nanorc" "$HOME/.nanorc.pre-bootstrap"
-  cat > "$HOME/.nanorc" <<'NANORC'
+  claim "$HOME/.nanorc" && cat > "$HOME/.nanorc" <<'NANORC'
 ## ~/.nanorc — managed by dev-bootstrap.sh
 
 ## --- behaviour -------------------------------------------------------------
@@ -1379,6 +1604,7 @@ NANORC
   # --------------------------------------------------------------- micro ----
   if have micro; then
     mkdir -p "$HOME/.config/micro/colorschemes"
+    claim "$HOME/.config/micro/colorschemes/catppuccin-mocha.micro" && \
     cat > "$HOME/.config/micro/colorschemes/catppuccin-mocha.micro" <<'MICROTHEME'
 color-link default              "#cdd6f4,#1e1e2e"
 color-link comment              "#6c7086"
@@ -1430,6 +1656,9 @@ color-link diff-added           "#a6e3a1"
 color-link diff-modified        "#f9e2af"
 color-link diff-deleted         "#f38ba8"
 MICROTHEME
+    # JSON takes no comments, so this one carries no marker of ours: the
+    # backup below is made once, on the first run, and never refreshed.
+    claim "$HOME/.config/micro/settings.json" && \
     cat > "$HOME/.config/micro/settings.json" <<'MICROSET'
 {
     "colorscheme": "catppuccin-mocha",
@@ -1472,7 +1701,7 @@ MICROSET
   fi
 
   # ---------------------------------------------------------------- psql ----
-  cat > "$HOME/.psqlrc" <<'PSQLRC'
+  claim "$HOME/.psqlrc" && cat > "$HOME/.psqlrc" <<'PSQLRC'
 -- ~/.psqlrc — managed by dev-bootstrap.sh
 \set QUIET 1
 
@@ -1530,82 +1759,101 @@ fi
 # ============================================================ git config ====
 if [[ "$SKIP_GIT_CONF" != "1" ]]; then
 log "Configuring git"
-git config --global init.defaultBranch main
-git config --global pull.rebase true
-git config --global rebase.autoStash true
-git config --global fetch.prune true
-git config --global push.default current
-git config --global push.autoSetupRemote true
-git config --global diff.colorMoved zebra
-git config --global diff.algorithm histogram
-git config --global diff.mnemonicPrefix true
-git config --global diff.renames copies
-git config --global merge.conflictstyle zdiff3
-git config --global rerere.enabled true
-git config --global rerere.autoupdate true
-git config --global core.editor "$DEV_EDITOR"
-git config --global core.autocrlf input
-git config --global color.ui auto
-git config --global column.ui auto
-git config --global branch.sort -committerdate      # most recent branch first
-git config --global tag.sort version:refname        # v1.10 after v1.9, not before
-git config --global log.date iso
-git config --global commit.verbose true             # show the diff while writing a message
-git config --global help.autocorrect prompt
-git config --global credential.helper "cache --timeout=28800"
+# --replace-all, not a plain set: `git config --global key value` FAILS outright
+# ("cannot overwrite multiple values with a single value") when the key is in
+# the file twice, which is the normal state of a ~/.gitconfig that has been
+# hand-edited a few times or merged from two dotfile repos. --replace-all
+# collapses the duplicates into our value instead of aborting.
+gitset() { git config --global --replace-all "$1" "$2"; }
+
+# An include pulled in AFTER our settings wins over them, and it is not ours
+# to edit — so say so rather than leaving you to wonder why a value is ignored.
+while IFS= read -r inc; do
+  [[ -z "$inc" ]] && continue
+  warn "your git config includes ${inc} — anything set there overrides the settings below"
+done < <(git config --global --get-all include.path 2>/dev/null)
+
+gitset init.defaultBranch main
+gitset pull.rebase true
+gitset rebase.autoStash true
+gitset fetch.prune true
+gitset push.default current
+gitset push.autoSetupRemote true
+gitset diff.colorMoved zebra
+gitset diff.algorithm histogram
+gitset diff.mnemonicPrefix true
+gitset diff.renames copies
+gitset merge.conflictstyle zdiff3
+gitset rerere.enabled true
+gitset rerere.autoupdate true
+gitset core.editor "$DEV_EDITOR"
+gitset core.autocrlf input
+gitset color.ui auto
+gitset column.ui auto
+gitset branch.sort -committerdate      # most recent branch first
+gitset tag.sort version:refname        # v1.10 after v1.9, not before
+gitset log.date iso
+gitset commit.verbose true             # show the diff while writing a message
+gitset help.autocorrect prompt
+gitset credential.helper "cache --timeout=28800"
 # safe.directory takes a literal path or a trailing /* (one level, no recursion
 # into nested repos). Verified against git 2.53 on a root-owned repo under /srv/dev.
-git config --global --replace-all safe.directory "${DEV_ROOT}/*" || true
-git config --global alias.st "status -sb"
-git config --global alias.lg "log --oneline --graph --decorate --all"
-git config --global alias.last "log -1 HEAD --stat"
-git config --global alias.unstage "reset HEAD --"
-git config --global alias.amend "commit --amend --no-edit"
-git config --global alias.wip "commit -am wip --no-verify"
-git config --global alias.undo "reset --soft HEAD~1"
-git config --global alias.branches "branch -a --sort=-committerdate"
-git config --global alias.recent "for-each-ref --sort=-committerdate --count=15 --format='%(refname:short)  %(committerdate:relative)' refs/heads/"
+# Added, never --replace-all'd: that would wipe every other safe.directory you
+# have. Adding it only when it is missing keeps the list free of duplicates too.
+git config --global --get-all safe.directory 2>/dev/null | grep -qxF "${DEV_ROOT}/*" \
+  || git config --global --add safe.directory "${DEV_ROOT}/*" || true
+gitset alias.st "status -sb"
+gitset alias.lg "log --oneline --graph --decorate --all"
+gitset alias.last "log -1 HEAD --stat"
+gitset alias.unstage "reset HEAD --"
+gitset alias.amend "commit --amend --no-edit"
+gitset alias.wip "commit -am wip --no-verify"
+gitset alias.undo "reset --soft HEAD~1"
+gitset alias.branches "branch -a --sort=-committerdate"
+gitset alias.recent "for-each-ref --sort=-committerdate --count=15 --format='%(refname:short)  %(committerdate:relative)' refs/heads/"
 
 # delta: syntax-highlighted, side-by-side-capable diff pager. Only wired up if
 # it actually installed, and the theme is probed rather than assumed — an
 # unknown syntax-theme makes delta fail on every diff.
 if have delta; then
   sub "wiring git diffs through delta"
-  git config --global core.pager "delta"
-  git config --global interactive.diffFilter "delta --color-only"
-  git config --global delta.navigate true          # n / N jump between files
-  git config --global delta.line-numbers true
-  git config --global delta.hyperlinks false
-  git config --global delta.dark true
+  gitset core.pager "delta"
+  gitset interactive.diffFilter "delta --color-only"
+  gitset delta.navigate true          # n / N jump between files
+  gitset delta.line-numbers true
+  gitset delta.hyperlinks false
+  gitset delta.dark true
   if delta --list-syntax-themes 2>/dev/null | grep -qx "Catppuccin Mocha"; then
-    git config --global delta.syntax-theme "Catppuccin Mocha"
+    gitset delta.syntax-theme "Catppuccin Mocha"
   else
-    git config --global delta.syntax-theme "OneHalfDark"
+    gitset delta.syntax-theme "OneHalfDark"
   fi
-  git config --global merge.conflictstyle zdiff3
+  gitset merge.conflictstyle zdiff3
 else
   # Leave any previous delta wiring behind rather than pointing core.pager at a
-  # binary that is no longer installed.
-  [[ "$(git config --global core.pager)" == delta* ]] && \
-    git config --global --unset core.pager
-  [[ "$(git config --global interactive.diffFilter)" == delta* ]] && \
-    git config --global --unset interactive.diffFilter
+  # binary that is no longer installed. --unset-all, because the same file may
+  # carry the key more than once.
+  [[ "$(git config --global --get core.pager 2>/dev/null)" == delta* ]] && \
+    git config --global --unset-all core.pager
+  [[ "$(git config --global --get interactive.diffFilter 2>/dev/null)" == delta* ]] && \
+    git config --global --unset-all interactive.diffFilter
 fi
 # Identity, as collected at the top of the run (env > prompt > what git had).
 if [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]]; then
-  git config --global user.name  "$GIT_USER_NAME"
-  git config --global user.email "$GIT_USER_EMAIL"
+  gitset user.name  "$GIT_USER_NAME"
+  gitset user.email "$GIT_USER_EMAIL"
   sub "identity: ${GIT_USER_NAME} <${GIT_USER_EMAIL}>"
 else
-  [[ -n "$GIT_USER_NAME"  ]] && git config --global user.name  "$GIT_USER_NAME"
-  [[ -n "$GIT_USER_EMAIL" ]] && git config --global user.email "$GIT_USER_EMAIL"
+  [[ -n "$GIT_USER_NAME"  ]] && gitset user.name  "$GIT_USER_NAME"
+  [[ -n "$GIT_USER_EMAIL" ]] && gitset user.email "$GIT_USER_EMAIL"
 fi
-if ! git config --global user.email >/dev/null; then
+if ! git config --global --get user.email >/dev/null 2>&1; then
   warn "git identity not set — re-run on a terminal to be asked for it, or set it by hand:"
   warn "  git config --global user.name 'Your Name'"
   warn "  git config --global user.email 'you@example.com'"
 fi
-cat > "$HOME/.gitignore_global" <<'GITIGNORE'
+claim "$HOME/.gitignore_global" && cat > "$HOME/.gitignore_global" <<'GITIGNORE'
+# ~/.gitignore_global — managed by dev-bootstrap.sh
 .DS_Store
 *.swp
 *~
@@ -1623,7 +1871,7 @@ node_modules/
 .ipynb_checkpoints/
 Thumbs.db
 GITIGNORE
-git config --global core.excludesfile "$HOME/.gitignore_global"
+gitset core.excludesfile "$HOME/.gitignore_global"
 fi
 
 # ================================================== microsoft sql tooling ===
@@ -1993,6 +2241,13 @@ ver rg       "$(rg --version 2>/dev/null | awk 'NR==1{print $2}')"
 ver fzf      "$(fzf --version 2>/dev/null | awk '{print $1}')"
 ver gh       "$(gh --version 2>/dev/null | awk 'NR==1{print $3}')"
 
+if (( ${#ADOPTED[@]} )); then
+  echo
+  log "Config that was already here"
+  for a in "${ADOPTED[@]}"; do sub "$a"; done
+  sub "the *.pre-bootstrap copies are yours — this script never touches them again"
+fi
+
 echo
 if (( ${#FAILED_STEPS[@]} )); then
   warn "Did not complete: ${FAILED_STEPS[*]}"
@@ -2005,4 +2260,5 @@ sub "ll                           # long listing (also: la lt lt3 ltr lsz ldot)"
 sub "claude                       # authenticate once; 'cc' is the shortcut"
 sub "touch ~/.no-auto-tmux        # if you don't want tmux on login"
 sub "\$EDITOR ~/.config/dev-bootstrap/local.sh   # your own aliases, never overwritten"
+sub "ls ~/.*.pre-bootstrap        # the config you had before the first run"
 sub "bash $0 --clean-only         # remove this script's apt sources"

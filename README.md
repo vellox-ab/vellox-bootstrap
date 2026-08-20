@@ -49,13 +49,14 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 | `PG_MAJOR` | `18` | Preferred PGDG client major version |
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `vim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
+| `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
 `SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`,
 `SKIP_EDITOR_CONF`, `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
-`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC` — set any of them to `1`.
+`SKIP_CLAUDE_CONF`, `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN` — set any of them to `1`.
 
 ### Git identity
 
@@ -128,7 +129,8 @@ identity is still unset at the end.
   correct `permissions.allow` list for the commands you keep approving — better
   than any list guessed up front.
 - **tmux** — a full `tmux.conf` with Catppuccin Mocha, vi copy mode, sane splits
-  and navigation.
+  and navigation, applied to a running server as well as to new ones (see
+  [Existing config on the machine](#existing-config-on-the-machine)).
 - **Shell** — `~/.config/dev-bootstrap/rc.sh` with PATH, truecolor, a shared-dev
   umask, history tuning, a git-aware Catppuccin prompt, and aliases for listing,
   git, databases, tmux, Python and misc tools. Your own overrides live in
@@ -151,6 +153,50 @@ identity is still unset at the end.
 At the end it verifies the login-shell wiring, prints the version of everything
 it installed, and lists anything that did not complete.
 
+## Existing config on the machine
+
+A box that has been set up before does not become this box just because new
+files are written — the old settings keep running. So before anything is
+written, the script clears out what would fight it. `SKIP_LEGACY_CLEAN=1` turns
+all of it off.
+
+- **The files it writes, it owns.** `~/.tmux.conf`, `~/.inputrc`, `~/.nanorc`,
+  `~/.psqlrc`, `~/.gitignore_global`, the micro config and
+  `~/.claude/statusline.sh` are written whole, so a re-run always lands on the
+  same content. What was there before the *first* run is kept as
+  `<file>.pre-bootstrap`, once — a later run never overwrites that copy with
+  one of our own generated files. The exception stays the exception:
+  `~/.claude/settings.json` is yours, and only missing keys are seeded.
+- **Symlinks are removed, not written through.** If a dotfile manager (stow,
+  chezmoi, oh-my-tmux) has `~/.tmux.conf` pointing into a repo, `cat >` would
+  silently rewrite the file in that repo. The link goes instead; its target is
+  left exactly as it is.
+- **Old `dev-bootstrap` blocks go**, in every startup file — including one left
+  behind in a file this run no longer hooks, and duplicates from older runs.
+- **A tmux autostart of your own is commented out** (with the file backed up
+  first). `exec tmux` replaces the shell and `tmux attach` blocks until you
+  detach, so either way every line after it — including the one that loads all
+  of this — never runs. Ours is the one that stays; set
+  `DEV_TMUX_AUTOSTART=0` if you would rather keep yours.
+- **A running tmux server is put back to stock before the new config is
+  applied.** Sourcing a config never *un*sets anything, so options and key
+  bindings from the config that was live when the server started survive until
+  the last session dies — the classic "I rewrote `tmux.conf` and half of it did
+  nothing". Global, per-session and per-window options are reset to their
+  defaults, the default key bindings are read out of a throwaway server started
+  with `-f /dev/null` and replayed, and only then is `~/.tmux.conf` sourced.
+  `DEV_TMUX_RESET=0` leaves a running server alone.
+- **git settings are written with `--replace-all`.** A plain
+  `git config --global key value` *fails* when the key appears twice in
+  `~/.gitconfig`, which is the normal state after a few hand edits or a merged
+  dotfile repo. `safe.directory` is the one that is added rather than replaced,
+  so the entries you added yourself survive.
+- **What cannot be overwritten is reported**: an `INPUTRC` or
+  `GIT_CONFIG_GLOBAL` pointing elsewhere, a `~/.gitconfig` `include.path` that
+  overrides everything below it, a leftover TPM plugin tree, `/etc/tmux.conf`.
+
+Everything moved aside is listed again at the end of the run.
+
 ## Design notes
 
 - **Idempotent and self-cleaning.** Every re-run first removes the apt sources
@@ -166,4 +212,4 @@ it installed, and lists anything that did not complete.
 
 ## Version
 
-Current version: **5.4.0** (see `VERSION`).
+Current version: **5.5.0** (see `VERSION`).
