@@ -56,6 +56,7 @@ DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
 | `DEV_START_DIR` | asked for | Folder every login starts in; setting it skips the prompt |
+| `DEV_AI_AGENTS` | asked for | `claude`, `codex`, `both` or `none`; setting it skips the prompt |
 | `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
@@ -64,7 +65,7 @@ DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
 `SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`, `SKIP_HARDENING`,
-`SKIP_CLAUDE`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`,
+`SKIP_CLAUDE`, `SKIP_CODEX`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`,
 `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`, `SKIP_CLAUDE_CONF`,
 `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set any of them to `1`.
 
@@ -125,6 +126,26 @@ To change it later, re-run with `DEV_START_DIR=...`, or set it in
 two places above reads the value, so it takes effect on the next login with no
 re-run at all.
 
+### AI coding agents
+
+The third question is which AI coding agent to install:
+
+```
+==> AI coding agents
+    claude = Claude Code, codex = OpenAI Codex, both, or none
+    Which?         [claude]:
+```
+
+The default is your previous answer (`claude` on the first run), so a re-run is
+just Enter. The choice only governs installation: an agent already on the
+machine is never removed, and the config sections still apply to whatever is
+present.
+
+```bash
+DEV_AI_AGENTS=both bash dev-bootstrap.sh    # answer up front (claude|codex|both|none)
+SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
+```
+
 ## What it installs and configures
 
 - **System packages** — build toolchain, `git`/`git-lfs`/`gh`/`git-delta`,
@@ -173,7 +194,8 @@ re-run at all.
   `csharp-lsp` plugin runs. `DOTNET_ROOT` is exported **only** for the private
   install — setting it against an apt-installed SDK breaks every `dotnet`
   command.
-- **Claude Code** — installed to `~/.local/bin/claude` (alias `cc`), plus:
+- **Claude Code** — installed to `~/.local/bin/claude` (alias `cc`) when chosen
+  at the agents prompt (the default), plus:
   - `~/.claude/statusline.sh`, a Catppuccin Mocha status line showing model,
     directory, git branch, context use and session cost. Fully managed —
     rewritten on every run.
@@ -198,6 +220,10 @@ re-run at all.
   once you have a week of history. It reads your transcripts and writes a
   correct `permissions.allow` list for the commands you keep approving — better
   than any list guessed up front.
+- **OpenAI Codex** — installed as an npm global (`@openai/codex`) when chosen at
+  the agents prompt, so it lands in `~/.local/bin/codex` and upgrades with
+  `npm update -g @openai/codex`. Aliases `cx`, `cxc` (resume latest), `cxr`
+  (resume picker). Its config (`~/.codex/`) is left entirely alone.
 - **tmux** — a full `tmux.conf` with Catppuccin Mocha, vi copy mode, sane splits
   and navigation, applied to a running server as well as to new ones (see
   [Existing config on the machine](#existing-config-on-the-machine)).
@@ -287,4 +313,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.7.1** (see `VERSION`).
+Current version: **5.8.0** (see `VERSION`).

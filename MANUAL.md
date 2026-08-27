@@ -5,7 +5,7 @@ where it lives on disk, how the pieces fit together, and how to turn each one
 off. Written so that a person — or an AI session with this repository open —
 can answer "how does X work on this machine?" without reading the script.
 
-Script version: **5.7.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
+Script version: **5.8.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ---
 
@@ -25,9 +25,10 @@ Script version: **5.7.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
   `managed-by: dev-bootstrap`) is removed at the start of each run and
   re-derived for the release it is running on. Sources it did not create are
   listed but never touched. `--clean-only` does just the removal.
-- Two questions are asked near the start, reading from `/dev/tty` so they
-  also work when piped from curl: the **git identity** and the **start
-  folder**. Both can be pre-answered with environment variables and both are
+- Three questions are asked near the start, reading from `/dev/tty` so they
+  also work when piped from curl: the **git identity**, the **start
+  folder** and the **AI coding agents** (Claude Code, OpenAI Codex, both or
+  none). All can be pre-answered with environment variables and all are
   skipped when there is no terminal.
 
 ### 1.2 Sections, in execution order
@@ -35,29 +36,30 @@ Script version: **5.7.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | # | Section | Skip flag | What it does |
 |---|---|---|---|
 | 1 | preflight | — | OS/arch/apt detection, sudo, `~/.local/bin`, `~/.config/dev-bootstrap` |
-| 2 | git identity / start folder | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the two prompts |
+| 2 | git identity / start folder / agents | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the three prompts |
 | 3 | cleanup | — | remove our old apt artifacts |
 | 4 | system packages | `SKIP_SYSTEM` | one apt transaction for `BASE_PKGS` |
 | 5 | node | `SKIP_NODE` | Node ≥ `NODE_MAJOR` + npm globals |
 | 6 | python | `SKIP_PYTHON` | uv, pipx tools |
 | 7 | .NET | `SKIP_DOTNET` | SDK + global tools |
-| 8 | claude code | `SKIP_CLAUDE` | native installer |
-| 9 | extra tools | `SKIP_EXTRAS` | GitHub-release tools, mise, bash-preexec |
-| 10 | docker | `SKIP_DOCKER` | docker-ce or docker.io, group, lazydocker, dive |
-| 11 | claude code conf | `SKIP_CLAUDE_CONF` | status line, settings seed, LSP plugins |
-| 12 | old shell config | `SKIP_LEGACY_CLEAN` | neutralise earlier setups |
-| 13 | tmux.conf | `SKIP_TMUX_CONF` | write + hot-reload |
-| 14 | shell config | `SKIP_SHELL_CONF` | write `rc.sh`, hook `.bashrc`, login bridge |
-| 15 | completions | `SKIP_SHELL_CONF` | pre-generate completion files |
-| 16 | inputrc | `SKIP_INPUTRC` | readline |
-| 17 | editor config | `SKIP_EDITOR_CONF` | bat theme, nano, micro, nvim, starship, atuin, lazygit, tealdeer, fastfetch, psql |
-| 18 | rc.sh tail | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
-| 19 | git config | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
-| 20 | MS SQL tooling | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
-| 21 | postgres | `SKIP_POSTGRES` | psql from PGDG |
-| 22 | system tuning | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
-| 23 | hardening | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
-| 24 | verify | — | apt health, login-shell probe, version table |
+| 8 | claude code | `SKIP_CLAUDE` | native installer (if chosen at the agents prompt) |
+| 9 | openai codex | `SKIP_CODEX` | npm global (if chosen at the agents prompt) |
+| 10 | extra tools | `SKIP_EXTRAS` | GitHub-release tools, mise, bash-preexec |
+| 11 | docker | `SKIP_DOCKER` | docker-ce or docker.io, group, lazydocker, dive |
+| 12 | claude code conf | `SKIP_CLAUDE_CONF` | status line, settings seed, LSP plugins |
+| 13 | old shell config | `SKIP_LEGACY_CLEAN` | neutralise earlier setups |
+| 14 | tmux.conf | `SKIP_TMUX_CONF` | write + hot-reload |
+| 15 | shell config | `SKIP_SHELL_CONF` | write `rc.sh`, hook `.bashrc`, login bridge |
+| 16 | completions | `SKIP_SHELL_CONF` | pre-generate completion files |
+| 17 | inputrc | `SKIP_INPUTRC` | readline |
+| 18 | editor config | `SKIP_EDITOR_CONF` | bat theme, nano, micro, nvim, starship, atuin, lazygit, tealdeer, fastfetch, psql |
+| 19 | rc.sh tail | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
+| 20 | git config | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
+| 21 | MS SQL tooling | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
+| 22 | postgres | `SKIP_POSTGRES` | psql from PGDG |
+| 23 | system tuning | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
+| 24 | hardening | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
+| 25 | verify | — | apt health, login-shell probe, version table |
 
 ### 1.3 Settings (environment variables)
 
@@ -66,6 +68,7 @@ Script version: **5.7.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | `DEV_ROOT` | `/srv/dev` | shared project folder; `dev <name>` opens `$DEV_ROOT/<name>` |
 | `DEV_GROUP` | `devgroup` | group expected to own `DEV_ROOT` (only checked, never created) |
 | `DEV_START_DIR` | asked | folder every login lands in |
+| `DEV_AI_AGENTS` | asked | `claude`, `codex`, `both` or `none` — which AI agent to install |
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim`; becomes `$EDITOR` and `core.editor` |
 | `DEV_TMUX_AUTOSTART` | `1` | attach tmux on interactive login |
 | `DEV_TMUX_RESET` | `1` | reset a running tmux server before reloading the config |
@@ -122,7 +125,8 @@ are skipped with a warning.
 anything named `local*` in that directory), `~/.config/nvim/lua/local.lua`.
 
 State the script keeps for itself: `~/.config/dev-bootstrap/start-dir` (the
-last start-folder answer) and `~/.config/dev-bootstrap/bash-preexec.sh`.
+last start-folder answer), `~/.config/dev-bootstrap/ai-agents` (the last
+agents answer) and `~/.config/dev-bootstrap/bash-preexec.sh`.
 Anything else in that directory is treated as a leftover from an older version
 and deleted on the next run.
 
@@ -233,6 +237,7 @@ Useful: `atuin stats`, `atuin search --cwd . foo`, `atuin history list --cmd-onl
 | `vim vi vimdiff` | `nvim` |
 | `e` / `sue` | `$EDITOR` / `sudoedit` |
 | `cc ccc ccr ccp ccdoc` | `claude`, `--continue`, `--resume`, `--permission-mode plan`, `doctor` |
+| `cx cxc cxr` | `codex`, `resume --last`, `resume` |
 | `gs ga gc gca gp gpl gd gds gl gll gb gco gsw gst` | git shortcuts |
 | `lg` | `lazygit` |
 | `d dc dps dimg dlog dprune lzd` | docker, compose, formatted ps/images, logs, prune, lazydocker |
@@ -516,6 +521,15 @@ stops it.
   come from the node section (`pyright`, `typescript-language-server`) and
   the .NET section (`csharp-ls`), and the run checks each is on PATH.
 - Worth running once after a week of use: `/fewer-permission-prompts`.
+
+### 4.11 OpenAI Codex
+
+- Installed only when chosen at the agents prompt (`DEV_AI_AGENTS`), as the
+  `@openai/codex` npm global — so it lands in `~/.local/bin/codex` and
+  `npm update -g @openai/codex` upgrades it. Needs npm: with `SKIP_NODE=1`
+  on a box without it, the section warns instead of installing.
+- Aliases `cx`, `cxc` (resume the most recent session), `cxr` (resume picker).
+- Its config (`~/.codex/`) is never touched — authenticate once with `codex`.
 
 ---
 

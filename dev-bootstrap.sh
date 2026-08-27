@@ -58,6 +58,12 @@
 #   DEV_START_DIR=/srv/dev/app bash dev-bootstrap.sh   # answer up front
 #   SKIP_START_DIR=1 bash dev-bootstrap.sh             # never ask
 #
+# And it asks which AI coding agent to install: Claude Code, OpenAI Codex,
+# both, or none. That answer is remembered too.
+#
+#   DEV_AI_AGENTS=both bash dev-bootstrap.sh    # claude | codex | both | none
+#   SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
+#
 # Deliberately NOT using `set -e`: a single failing repo must never leave the
 # machine half-configured. Failures are collected and reported at the end.
 #
@@ -74,6 +80,7 @@ PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | nvim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
 DEV_START_DIR="${DEV_START_DIR:-}"      # empty = ask; where a login lands
+DEV_AI_AGENTS="${DEV_AI_AGENTS:-}"      # empty = ask; claude | codex | both | none
 CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
@@ -91,6 +98,7 @@ DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
 # LAN or VPN is never locked out. SSH is allowed from everywhere regardless.
 DEV_UFW_TRUST="${DEV_UFW_TRUST:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
+SKIP_CODEX="${SKIP_CODEX:-0}"
 SKIP_CLAUDE_CONF="${SKIP_CLAUDE_CONF:-0}"
 SKIP_TMUX_CONF="${SKIP_TMUX_CONF:-0}"
 SKIP_SHELL_CONF="${SKIP_SHELL_CONF:-0}"
@@ -110,6 +118,7 @@ MARKER_END="# <<< dev-bootstrap <<<"
 MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
 BACKUP_SUFFIX=".pre-bootstrap"
 START_DIR_STATE="$CONF_DIR/start-dir"   # remembers the answer between runs
+AI_AGENTS_STATE="$CONF_DIR/ai-agents"   # remembers the agent choice between runs
 
 for arg in "$@"; do
   case "$arg" in
@@ -375,6 +384,53 @@ DEV_START_DIR="${DEV_START_DIR%/}"; [[ -z "$DEV_START_DIR" ]] && DEV_START_DIR="
 # Remembered so the next run can offer it as the default, and so this stays
 # put when a later run has no terminal to ask from.
 [[ "$CLEAN_ONLY" == "1" ]] || printf '%s\n' "$DEV_START_DIR" > "$START_DIR_STATE" 2>/dev/null || true
+
+# ---------------------------------------------------------- coding agents ---
+# Which AI coding agent to install: Claude Code, OpenAI Codex, both, or none.
+# Asked here with the other questions, for the same reason they are.
+#
+# Precedence: DEV_AI_AGENTS from the environment wins outright and suppresses
+# the prompt, then the answer from the last run, then "claude". The choice only
+# governs INSTALLATION — an agent that is already on the machine is never
+# removed, and the config sections still apply to whatever is present.
+# SKIP_CLAUDE=1 / SKIP_CODEX=1 veto an install regardless of the answer.
+ai_agents_default="$DEV_AI_AGENTS"
+[[ -z "$ai_agents_default" && -s "$AI_AGENTS_STATE" ]] && \
+  ai_agents_default="$(head -1 "$AI_AGENTS_STATE")"
+[[ -z "$ai_agents_default" ]] && ai_agents_default="claude"
+
+if [[ "$CLEAN_ONLY" != "1" && -z "$DEV_AI_AGENTS" ]] \
+   && (exec </dev/tty) 2>/dev/null; then
+  log "AI coding agents"
+  sub "claude = Claude Code, codex = OpenAI Codex, both, or none"
+  ai_answer=""                          # ask_tty fills this in with printf -v
+  while :; do
+    ask_tty ai_answer "Which?" "$ai_agents_default"
+    ai_answer="${ai_answer,,}"
+    case "$ai_answer" in
+      claude|codex|both|none) DEV_AI_AGENTS="$ai_answer"; break ;;
+      *) warn "answer claude, codex, both or none" ;;
+    esac
+  done
+fi
+
+# Nothing was asked (no terminal, or a value from the environment): settle on
+# the default and validate it the same way.
+[[ -z "$DEV_AI_AGENTS" ]] && DEV_AI_AGENTS="$ai_agents_default"
+DEV_AI_AGENTS="${DEV_AI_AGENTS,,}"
+case "$DEV_AI_AGENTS" in
+  claude|codex|both|none) ;;
+  *) warn "DEV_AI_AGENTS='$DEV_AI_AGENTS' is not claude/codex/both/none — using claude"
+     DEV_AI_AGENTS="claude" ;;
+esac
+INSTALL_CLAUDE=0; INSTALL_CODEX=0
+[[ "$DEV_AI_AGENTS" == "claude" || "$DEV_AI_AGENTS" == "both" ]] && INSTALL_CLAUDE=1
+[[ "$DEV_AI_AGENTS" == "codex"  || "$DEV_AI_AGENTS" == "both" ]] && INSTALL_CODEX=1
+[[ "$SKIP_CLAUDE" == "1" ]] && INSTALL_CLAUDE=0
+[[ "$SKIP_CODEX"  == "1" ]] && INSTALL_CODEX=0
+# Remembered so the next run can offer it as the default, and so this stays
+# put when a later run has no terminal to ask from.
+[[ "$CLEAN_ONLY" == "1" ]] || printf '%s\n' "$DEV_AI_AGENTS" > "$AI_AGENTS_STATE" 2>/dev/null || true
 
 # =============================================================== cleanup ====
 # Remove every apt artifact this script family has ever created, in any format,
@@ -648,12 +704,29 @@ if [[ "$SKIP_DOTNET" != "1" ]]; then
 fi
 
 # ============================================================= claude code ==
-if [[ "$SKIP_CLAUDE" != "1" ]]; then
+if [[ "$INSTALL_CLAUDE" == "1" ]]; then
   if have claude || [[ -x "$HOME/.local/bin/claude" ]]; then
     log "Claude Code already present ($("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}'))"
   else
     log "Installing Claude Code (native installer, per-user, auto-updating)"
     soft "claude-code" bash -c 'curl -fsSL --max-time 120 https://claude.ai/install.sh | bash' || true
+  fi
+fi
+
+# ============================================================ openai codex ==
+# An npm global (OpenAI's install channel besides Homebrew), so it lands in
+# ~/.local/bin like the other npm tools and `npm update -g @openai/codex`
+# upgrades it. That makes it depend on the node section — with SKIP_NODE=1 on
+# a box without npm there is nothing to install with, and the run says so.
+if [[ "$INSTALL_CODEX" == "1" ]]; then
+  if have codex || [[ -x "$HOME/.local/bin/codex" ]]; then
+    log "OpenAI Codex already present ($("$HOME/.local/bin/codex" --version 2>/dev/null | awk '{print $NF}'))"
+  elif have npm; then
+    log "Installing OpenAI Codex (npm global, per-user)"
+    soft "openai-codex" npm install -g --silent @openai/codex || true
+  else
+    warn "OpenAI Codex is installed via npm, and npm is missing — re-run without SKIP_NODE=1"
+    note_fail "openai-codex"
   fi
 fi
 
@@ -1068,13 +1141,13 @@ if [[ "$SKIP_LEGACY_CLEAN" != "1" ]]; then
   # rc.sh, theme.sh and completions/ are regenerated below, so whatever else is
   # in there came from an older version of this script and is now dead weight:
   # nothing sources it any more. Anything called local* is yours and stays, and
-  # so does start-dir: it is this run's memory of the start-folder answer.
+  # so do start-dir and ai-agents: this run's memory of the prompt answers.
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     rm -rf "$f"; sub "removed stale $(hp "$f")"; legacy_cleaned=$((legacy_cleaned+1))
   done < <(find "$CONF_DIR" -mindepth 1 -maxdepth 1 \
              ! -name 'local*' ! -name rc.sh ! -name theme.sh ! -name completions \
-             ! -name start-dir ! -name bash-preexec.sh 2>/dev/null)
+             ! -name start-dir ! -name ai-agents ! -name bash-preexec.sh 2>/dev/null)
 
   (( legacy_cleaned == 0 )) && sub "nothing left over to clean"
 fi
@@ -1427,6 +1500,11 @@ alias ccc='claude --continue'          # resume the most recent session
 alias ccr='claude --resume'            # pick a session from a list
 alias ccp='claude --permission-mode plan'
 alias ccdoc='claude doctor'
+
+# ---- OpenAI Codex -----------------------------------------------------------
+alias cx='codex'
+alias cxc='codex resume --last'        # resume the most recent session
+alias cxr='codex resume'               # pick a session from a list
 
 # ---- listing ----------------------------------------------------------------
 #   ll   long listing, human sizes, no dotfiles   (the everyday one)
@@ -3046,6 +3124,7 @@ ver npm      "$(npm --version 2>/dev/null)"
 ver python3  "$(python3 --version 2>/dev/null | awk '{print $2}')"
 ver uv       "$("$HOME/.local/bin/uv" --version 2>/dev/null | awk '{print $2}')"
 ver claude   "$("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}')"
+ver codex    "$("$HOME/.local/bin/codex" --version 2>/dev/null | awk '{print $NF}')"
 ver dotnet   "$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | tail -1)"
 ver psql     "$(psql --version 2>/dev/null | awk '{print $3}')"
 # sqlcmd is either the mssql-tools18 build or the go-sqlcmd fallback binary.
@@ -3086,7 +3165,10 @@ fi
 log "Next"
 sub "exec bash -l                 # pick up PATH, theme, aliases"
 sub "ll                           # long listing (also: la lt lt3 ltr lsz ldot)"
-sub "claude                       # authenticate once; 'cc' is the shortcut"
+[[ -x "$HOME/.local/bin/claude" ]] || have claude && \
+  sub "claude                       # authenticate once; 'cc' is the shortcut"
+[[ -x "$HOME/.local/bin/codex" ]] || have codex && \
+  sub "codex                        # authenticate once; 'cx' is the shortcut"
 sub "touch ~/.no-auto-tmux        # if you don't want tmux on login"
 sub "lg / y / lzd / tldr <cmd>     # lazygit, yazi, lazydocker, quick examples"
 sub "Ctrl-R                       # atuin history search (fzf keeps Ctrl-T, Alt-C)"
