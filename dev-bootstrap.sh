@@ -1580,6 +1580,9 @@ alias ta='tmux attach -t'
 alias tl='tmux list-sessions'
 alias tn='tmux new -s'
 alias tk='tmux kill-session -t'
+# mousefix: switch mouse capture off again after a TUI (nano, vim, claude…)
+# crashed or was killed and left it on — drags then stop selecting in the pane.
+alias mousefix="printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l'"
 # dev <name>: attach to (or create) a tmux session rooted in the project folder
 dev() {
   local root="${DEV_ROOT:-/srv/dev}"
@@ -2047,7 +2050,9 @@ if [[ "$SKIP_EDITOR_CONF" != "1" ]]; then
 
 ## --- behaviour -------------------------------------------------------------
 set linenumbers          # line numbers in the margin
-set mouse                # click to position cursor, drag to select
+# Mouse: click positions the cursor. nano cannot drag-select — Shift+drag uses
+# the terminal's own selection instead, and Alt-M toggles nano's mouse off.
+set mouse
 set softwrap             # wrap long lines visually...
 set atblanks             # ...at word boundaries, not mid-word
 set tabstospaces

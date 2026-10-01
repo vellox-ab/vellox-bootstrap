@@ -5,7 +5,7 @@ where it lives on disk, how the pieces fit together, and how to turn each one
 off. Written so that a person — or an AI session with this repository open —
 can answer "how does X work on this machine?" without reading the script.
 
-Script version: **5.8.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
+Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ---
 
@@ -243,6 +243,7 @@ Useful: `atuin stats`, `atuin search --cwd . foo`, `atuin history list --cmd-onl
 | `d dc dps dimg dlog dprune lzd` | docker, compose, formatted ps/images, logs, prune, lazydocker |
 | `pg pgl sqlcmd` | `pgcli`, `psql -l`, `sqlcmd -C` (trust dev certs) |
 | `ta tl tn tk` | tmux attach/list/new/kill |
+| `mousefix` | turn mouse capture off in a pane a crashed TUI left it on in |
 | `py venv act` | python3, create venv, activate |
 | `wx` | `watchexec --clear` |
 | `trippy` | `trip` |
@@ -284,6 +285,14 @@ Config: `~/.tmux.conf`. Prefix **Ctrl-a**.
   Navigate with Alt+arrows (no prefix) or prefix + `hjkl`; resize with
   prefix + `HJKL`; Shift+Left/Right switch windows.
 - vi copy mode: prefix + Enter, `v` select, `y` copy; `set-clipboard on`.
+- **Mouse:** whoever has claimed the mouse gets the drag. At a shell prompt
+  that is tmux: drag highlights, and releasing the button copies (OSC 52 to
+  your terminal's clipboard — no Ctrl+C needed; Ctrl+C just goes to the
+  pane). Inside nano, vim, Claude Code, htop, less… the program gets it, and
+  tmux selects nothing. **Shift+drag** (Option on iTerm2) bypasses both and
+  uses the terminal's own selection — works everywhere, copy with Ctrl+C /
+  Ctrl+Shift+C. If drags stop working even at a prompt, a crashed TUI left
+  mouse capture on: `mousefix` (or `reset`).
 - `mouse on`, 200 000 line history, `escape-time 0`, truecolor
   (`tmux-256color` + RGB overrides), windows renumber, base index 1,
   `detach-on-destroy off`.
@@ -374,7 +383,9 @@ refreshes all of them.
 
 `DEV_EDITOR` (`nano` default) sets `$EDITOR`, `$VISUAL` and `core.editor`.
 
-- **nano** — `~/.nanorc`: line numbers, mouse, soft wrap, 4-space tabs,
+- **nano** — `~/.nanorc`: line numbers, mouse (click to place the cursor —
+  nano cannot drag-select; Shift+drag to copy out, Ctrl-A or Shift+arrows to
+  mark, Alt-M toggles the mouse), soft wrap, 4-space tabs,
   auto-indent, position/history logs, Catppuccin (12-bit colours because
   nano rejects 24-bit under `tmux-256color`), desktop-style keys (Ctrl-S
   save, Ctrl-Q quit, Ctrl-F find, Ctrl-Z/Y undo/redo, Ctrl-C/X/V). A
@@ -610,6 +621,7 @@ Base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, mauve `#cba6f7`, green
 | Prompt is the old bash one | starship not installed, or `DEV_PROMPT=bash` in `local.sh` |
 | `reload` prints errors about `;;` | fixed in 5.7.0 — re-run to regenerate `rc.sh` |
 | `installing plugin pyright-lsp` hangs forever | fixed in 5.7.1 — `claude` was stopped by SIGTTOU under `timeout`; press Ctrl-C on the stuck run and re-run |
+| Mouse drag highlights sometimes, not others | the program in the pane (nano, Claude Code, vim…) has the mouse; Shift+drag. Stuck even at a prompt: `mousefix` — see §3 |
 | tmux keeps old bindings | the server predates the config; `tmux kill-server` or re-run (`DEV_TMUX_RESET=1`) |
 | `docker: permission denied` | group membership needs a new login (`newgrp docker`) |
 | A published container port is reachable despite ufw | Docker bypasses ufw by design; bind to `127.0.0.1` |

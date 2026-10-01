@@ -313,4 +313,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.8.0** (see `VERSION`).
+Current version: **5.8.1** (see `VERSION`).
