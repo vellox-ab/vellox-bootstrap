@@ -23,8 +23,24 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 - **Self-cleaning.** Every apt source and keyring this script has *ever*
   created (`LEGACY_SOURCES`, `LEGACY_KEYS`, and anything carrying the text
   `managed-by: dev-bootstrap`) is removed at the start of each run and
-  re-derived for the release it is running on. Sources it did not create are
-  listed but never touched. `--clean-only` does just the removal.
+  re-derived for the release it is running on — also for tools that are
+  already installed, so apt keeps updating them. Sources it did not create are
+  listed but never touched.
+- **Leaves nothing unused behind.** npm globals it no longer installs
+  (`NPM_RETIRED`) are uninstalled; superseded PostgreSQL clients are marked
+  automatic; a GitHub-release copy in `~/.local/bin` goes once apt packages the
+  tool, and so does the go-sqlcmd fallback once `mssql-tools18` is in. The
+  leftovers section then removes dangling links in `~/.local/bin`, runs
+  `apt autoremove --purge`, and purges what removed kernels and Node packages
+  left behind (dpkg state `rc`).
+  - **Never removed:** database servers (`postgresql-NN` deletes its clusters
+    on purge), Docker (purging `docker.io` wipes `/var/lib/docker`, volumes
+    included) and the bootloader (purging `grub-pc` deletes
+    `/etc/default/grub`, which grub-efi reads too). Unused ones are marked
+    manual and reported; if marking fails, autoremove does not run at all.
+  - Other `rc` leftovers were removed by hand and may hold data, so they are
+    listed, not purged. `SKIP_AUTOREMOVE=1` lists the apt part and changes
+    nothing. `--clean-only` does just the removal.
 - Three questions are asked near the start, reading from `/dev/tty` so they
   also work when piped from curl: the **git identity**, the **start
   folder** and the **AI coding agents** (Claude Code, OpenAI Codex, both or
@@ -39,7 +55,7 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | 2 | git identity / start folder / agents | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the three prompts |
 | 3 | cleanup | — | remove our old apt artifacts |
 | 4 | system packages | `SKIP_SYSTEM` | one apt transaction for `BASE_PKGS` |
-| 5 | node | `SKIP_NODE` | Node ≥ `NODE_MAJOR` + npm globals |
+| 5 | node | `SKIP_NODE` | newest Node from NodeSource + npm globals, updated every run |
 | 6 | python | `SKIP_PYTHON` | uv, pipx tools |
 | 7 | .NET | `SKIP_DOTNET` | SDK + global tools |
 | 8 | claude code | `SKIP_CLAUDE` | native installer (if chosen at the agents prompt) |
@@ -56,10 +72,11 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | 19 | rc.sh tail | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
 | 20 | git config | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
 | 21 | MS SQL tooling | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
-| 22 | postgres | `SKIP_POSTGRES` | psql from PGDG |
+| 22 | postgres | `SKIP_POSTGRES` | newest psql from PGDG |
 | 23 | system tuning | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
 | 24 | hardening | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
-| 25 | verify | — | apt health, login-shell probe, version table |
+| 25 | leftovers | `SKIP_AUTOREMOVE` (lists only) | dangling links, `apt autoremove --purge`, purge kernel/Node residue |
+| 26 | verify | — | apt health, login-shell probe, version table |
 
 ### 1.3 Settings (environment variables)
 
@@ -72,10 +89,10 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim`; becomes `$EDITOR` and `core.editor` |
 | `DEV_TMUX_AUTOSTART` | `1` | attach tmux on interactive login |
 | `DEV_TMUX_RESET` | `1` | reset a running tmux server before reloading the config |
-| `NODE_MAJOR` | `22` | minimum Node major |
+| `NODE_MAJOR` | `lts` | `lts` (newest LTS), `current` (newest major) or a major number |
 | `DOTNET_MAJOR` | empty | pin an SDK major; empty = newest the distro offers |
 | `DOTNET_TOOLS` | `csharp-ls dotnet-ef` | .NET global tools |
-| `PG_MAJOR` | `18` | preferred PGDG client |
+| `PG_MAJOR` | empty | pin a client major; empty = newest PGDG carries |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Claude Code plugins |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | both set = no prompt |
 | `DEV_UFW_TRUST` | `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16` | networks ufw allows and fail2ban ignores |
@@ -454,20 +471,31 @@ refreshes all of them.
 
 ### 4.6 Languages and runtimes
 
-- **Node.js** — from Ubuntu when its version ≥ `NODE_MAJOR` (26.04), else
-  NodeSource (24.04 ships 18.x). npm prefix `~/.local`, so globals need no
-  sudo. Globals: `npm typescript ts-node tsx eslint prettier
-  typescript-language-server pyright pnpm nodemon pm2 mssql @ast-grep/cli`.
+- **Node.js** — from NodeSource on both releases (Ubuntu's is behind: 24.04
+  has 18, 26.04 has 22). `NODE_MAJOR=lts` (default) takes the newest LTS
+  major from nodejs.org's release index, `current` the newest major, a number
+  pins one; every run moves up when a newer one appears, and never downgrades.
+  Ubuntu's `npm`, `libnode-dev` and `node-corepack` are removed in the same
+  transaction — they collide with NodeSource's files. npm prefix `~/.local`,
+  so globals need no sudo; each run installs the latest of: `npm pnpm yarn
+  typescript@6 tsx typescript-language-server pyright eslint prettier
+  npm-check-updates (ncu) nodemon pm2 mssql @ast-grep/cli`; ones it used to
+  install (`NPM_RETIRED`: `ts-node`) are uninstalled. TypeScript stays
+  on 6 globally because 7 (the native compiler) ships no `tsserver.js`, and
+  `typescript-language-server` falls back to the global one in any project
+  without its own — projects keep using whatever `typescript` they pin.
 - **Python** — `python3`, venv, pip, dev headers; **uv** (`uv venv`, `uv
   pip`, `uvx tool`; `mkvenv` uses it); **pipx** tools: `ruff black isort
-  ipython httpie sqlfluff pre-commit pgcli harlequin`.
+  ipython httpie sqlfluff pre-commit pgcli harlequin`, upgraded every run.
 - **.NET** — SDK from Ubuntu (26.04 → 10.0, 24.04 → 8.0), or Microsoft's
   `dotnet-install.sh` into `~/.dotnet` if the distro has none. `DOTNET_ROOT`
   is exported **only** for that private install. Global tools in
   `~/.dotnet/tools`: `csharp-ls` (the C# language server for Claude),
   `dotnet-ef`. Telemetry off, no logo.
 - **mise** — per-project tool versions. It reads `.mise.toml`,
-  `.tool-versions`, `.nvmrc`, `.python-version` and swaps the tool on `cd`
+  `.tool-versions`, `.python-version`, and `.nvmrc` / `.node-version` (mise
+  ignores those by default; `rc.sh` sets
+  `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node`) and swaps the tool on `cd`
   (hooked into the prompt like direnv). **It is inert until a project pins
   something**: with no config file the apt Node and .NET stay in use.
   `mise use node@20` in a project writes the pin and installs that version
@@ -475,8 +503,12 @@ refreshes all of them.
 
 ### 4.7 Databases
 
-- **PostgreSQL client** — `psql` from PGDG (`postgresql-client-18`,
-  falling back to Ubuntu's when PGDG has no suite yet), `libpq-dev`.
+- **PostgreSQL client** — `psql` from PGDG, the newest
+  `postgresql-client-N` it carries (`PG_MAJOR` pins one; newest matters
+  because `pg_dump` refuses a server newer than itself), falling back to
+  Ubuntu's when PGDG has no suite yet; `libpq-dev` for native `pg` builds.
+  When a newer client lands, the older ones are marked automatic, so
+  `apt autoremove` takes them unless a local server of that major needs them.
   `~/.psqlrc`: unicode borders, `[null]`, timing, lower-case keyword
   completion, per-database history, shortcuts `:activity :locks :dbsize
   :tablesize :uptime :version`. Pager `pspg`.
@@ -499,7 +531,9 @@ refreshes all of them.
   `download.docker.com` (deb822 source, key in `/etc/apt/keyrings/docker.asc`)
   when that repo has a suite for the release; otherwise Ubuntu's `docker.io`
   + `docker-compose-v2` + `docker-buildx`. Either way the CLI is `docker`
-  and `docker compose`.
+  and `docker compose`. An installed docker-ce gets its source back on every
+  run so `apt upgrade` updates it; the bootstrap never upgrades it itself,
+  because that restarts dockerd and every running container.
 - The service is enabled, and the user is added to the `docker` group
   (effective at next login — `newgrp docker` for the current one).
 - **lazydocker** (`lzd`) — TUI over containers, images, volumes and compose
@@ -537,7 +571,7 @@ stops it.
 
 - Installed only when chosen at the agents prompt (`DEV_AI_AGENTS`), as the
   `@openai/codex` npm global — so it lands in `~/.local/bin/codex` and
-  `npm update -g @openai/codex` upgrades it. Needs npm: with `SKIP_NODE=1`
+  every re-run upgrades it. Needs npm: with `SKIP_NODE=1`
   on a box without it, the section warns instead of installing.
 - Aliases `cx`, `cxc` (resume the most recent session), `cxr` (resume picker).
 - Its config (`~/.codex/`) is never touched — authenticate once with `codex`.

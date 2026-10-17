@@ -43,16 +43,17 @@ variables:
 SKIP_MSSQL=1 bash dev-bootstrap.sh
 DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
+NODE_MAJOR=current bash dev-bootstrap.sh     # newest Node major, not newest LTS
 ```
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DEV_ROOT` | `/srv/dev` | Shared development folder |
 | `DEV_GROUP` | `devgroup` | Group that owns `DEV_ROOT` |
-| `NODE_MAJOR` | `22` | Minimum acceptable Node major version |
+| `NODE_MAJOR` | `lts` | `lts` (newest LTS), `current` (newest major) or a major number |
 | `DOTNET_MAJOR` | empty | Pin an SDK major; empty takes the newest the distro has |
 | `DOTNET_TOOLS` | `csharp-ls dotnet-ef` | .NET global tools to install |
-| `PG_MAJOR` | `18` | Preferred PGDG client major version |
+| `PG_MAJOR` | empty | Pin a PGDG client major; empty takes the newest |
 | `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim` |
 | `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
 | `DEV_START_DIR` | asked for | Folder every login starts in; setting it skips the prompt |
@@ -64,7 +65,7 @@ DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
 | `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads the tools that come from GitHub releases |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
-`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`, `SKIP_HARDENING`,
+`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`, `SKIP_HARDENING`, `SKIP_AUTOREMOVE`,
 `SKIP_CLAUDE`, `SKIP_CODEX`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`,
 `SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`, `SKIP_CLAUDE_CONF`,
 `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set any of them to `1`.
@@ -173,7 +174,9 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
     `harlequin` (TUI SQL IDE, Postgres + ODBC adapters), `ast-grep`
 - **Docker** — `docker-ce` with buildx and the compose plugin from Docker's own
   repo, or Ubuntu's `docker.io` + `docker-compose-v2` while that repo has no
-  suite for the release yet; you are added to the `docker` group. Plus
+  suite for the release yet; you are added to the `docker` group. An
+  installed docker-ce keeps its source so `apt upgrade` updates it — the
+  script never upgrades it itself, as that restarts every container. Plus
   `lazydocker` (`lzd`) and `dive`.
 - **Hardening** — `unattended-upgrades` for security updates, `fail2ban` on
   sshd (systemd backend, trusted ranges ignored), and `ufw` with incoming
@@ -182,8 +185,13 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   all of RFC 1918, so a box reached over a LAN or VPN keeps its dev ports and
   the firewall cannot lock you out. The SSH rule is added *before* the
   firewall is enabled, and enabling is skipped if that rule failed.
-- **Node.js** — from NodeSource when the distro version is older than
-  `NODE_MAJOR`.
+- **Node.js** — the newest LTS (or `NODE_MAJOR=current` / a pinned major)
+  from NodeSource on both releases, upgraded on every run, plus the latest
+  npm globals: `npm`, `pnpm`, `yarn`, `typescript@6`, `tsx`,
+  `typescript-language-server`, `pyright`, `eslint`, `prettier`,
+  `npm-check-updates`, `nodemon`, `pm2`, `mssql`, `@ast-grep/cli`.
+  TypeScript stays on 6 globally: 7 ships no `tsserver.js`, which the
+  TypeScript language server needs.
 - **Python** — `python3` with `venv`/`pip`/`dev`, `pipx`, `uv`, and the pipx
   tools `ruff`, `black`, `isort`, `ipython`, `httpie`, `sqlfluff`, `pre-commit`,
   `pgcli` and `harlequin`.
@@ -221,8 +229,8 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   correct `permissions.allow` list for the commands you keep approving — better
   than any list guessed up front.
 - **OpenAI Codex** — installed as an npm global (`@openai/codex`) when chosen at
-  the agents prompt, so it lands in `~/.local/bin/codex` and upgrades with
-  `npm update -g @openai/codex`. Aliases `cx`, `cxc` (resume latest), `cxr`
+  the agents prompt, so it lands in `~/.local/bin/codex`; every re-run
+  upgrades it. Aliases `cx`, `cxc` (resume latest), `cxr`
   (resume picker). Its config (`~/.codex/`) is left entirely alone.
 - **tmux** — a full `tmux.conf` with Catppuccin Mocha, vi copy mode, sane splits
   and navigation, applied to a running server as well as to new ones (see
@@ -246,7 +254,8 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   suite that actually has them (25.10 today), pinned so nothing *else* from
   that suite can leak in. If the repo route fails it installs the checksum-
   verified `.deb` files straight from the pool, and failing that, go-sqlcmd.
-- **PostgreSQL client** — `psql` from PGDG, plus a `psql` pager setup.
+- **PostgreSQL client** — the newest `psql` / `pg_dump` from PGDG, `libpq-dev`,
+  plus a `psql` pager setup.
 - **System tuning** — raised inotify limits (file watchers and agentic tooling),
   open-file limit lifted from the 1024 default, SSH keepalives.
 
@@ -302,8 +311,17 @@ Everything moved aside is listed again at the end of the run.
 
 - **Idempotent and self-cleaning.** Every re-run first removes the apt sources
   and keyrings that earlier versions of this script created, then re-derives
-  them for the release it is actually running on. Sources it did not create are
+  them for the release it is actually running on — for tools that are already
+  installed too, so apt keeps updating them. Sources it did not create are
   listed but never touched.
+- **Leaves nothing unused behind.** npm globals it no longer installs are
+  uninstalled, stale copies in `~/.local/bin` go once apt (or mssql-tools18)
+  provides the real thing, and the run ends by removing dangling links,
+  running `apt autoremove --purge`, and purging what removed kernels and Node
+  packages left behind. Database servers, Docker and the bootloader are never
+  removed — purging them deletes data or boot config — and other leftovers
+  of packages removed by hand are listed, not purged. `SKIP_AUTOREMOVE=1`
+  only lists.
 - **No `set -e`.** A single failing repo must never leave the machine
   half-configured. Failures are collected and reported at the end, and
   re-running retries only those steps.
@@ -313,4 +331,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.8.1** (see `VERSION`).
+Current version: **5.9.0** (see `VERSION`).

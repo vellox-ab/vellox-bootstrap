@@ -20,6 +20,15 @@
 #   SKIP_MSSQL=1 bash dev-bootstrap.sh     # skip a section
 #   DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
 #   DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
+#   NODE_MAJOR=current bash dev-bootstrap.sh     # newest Node major, not newest LTS
+#
+# Every run brings Node (NodeSource), its global npm tools and the PostgreSQL
+# client up to the newest release, and keeps their apt sources configured.
+# It ends by removing what nothing uses any more — unused packages, config
+# left by removed kernels and Node packages, stale copies in ~/.local/bin.
+# Database servers, Docker and the bootloader are never removed.
+#
+#   SKIP_AUTOREMOVE=1 bash dev-bootstrap.sh    # list leftover packages only
 #
 # Beyond the base packages it installs a set of extra tools (lazygit, atuin,
 # starship, mise, watchexec, difftastic, yazi, lnav, mosh, ttyd, ...), Docker
@@ -73,10 +82,10 @@ set -uo pipefail
 # ---------------------------------------------------------------- settings --
 DEV_ROOT="${DEV_ROOT:-/srv/dev}"
 DEV_GROUP="${DEV_GROUP:-devgroup}"
-NODE_MAJOR="${NODE_MAJOR:-22}"          # minimum acceptable Node major
+NODE_MAJOR="${NODE_MAJOR:-lts}"         # lts | current | a major number
 DOTNET_MAJOR="${DOTNET_MAJOR:-}"        # empty = newest SDK the distro offers
 DOTNET_TOOLS="${DOTNET_TOOLS:-csharp-ls dotnet-ef}"
-PG_MAJOR="${PG_MAJOR:-18}"              # preferred PGDG client major
+PG_MAJOR="${PG_MAJOR:-}"                # empty = newest client PGDG carries
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | nvim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
 DEV_START_DIR="${DEV_START_DIR:-}"      # empty = ask; where a login lands
@@ -93,6 +102,7 @@ SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
 SKIP_EXTRAS="${SKIP_EXTRAS:-0}"         # lazygit, atuin, starship, mise, ...
 SKIP_DOCKER="${SKIP_DOCKER:-0}"
 SKIP_HARDENING="${SKIP_HARDENING:-0}"   # unattended-upgrades, fail2ban, ufw
+SKIP_AUTOREMOVE="${SKIP_AUTOREMOVE:-0}" # 1 = list leftover packages, remove none
 DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
 # Networks the firewall and fail2ban trust outright: every RFC 1918 range, so a
 # LAN or VPN is never locked out. SSH is allowed from everywhere regardless.
@@ -228,7 +238,12 @@ login_rc_path() {
 
 apt_has()  { apt-cache show "$1" >/dev/null 2>&1; }
 apt_cand() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}'; }
-apt_installable() { apt-cache policy "$1" 2>/dev/null | grep -qE 'Candidate: [0-9]'; }
+# Not `apt-cache policy | grep -q`: grep -q quits at the match, apt-cache dies
+# of SIGPIPE writing the rest, and under pipefail that reads as "not
+# installable" — for every package, every time.
+apt_installable() { [[ "$(apt_cand "$1")" == [0-9]* ]]; }
+# dpkg -s also succeeds for a package removed with its config files kept.
+pkg_installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" == installed ]]; }
 
 # ============================================================== preflight ===
 [[ $EUID -eq 0 ]] && die "Run as your normal user, not root. sudo is used where needed."
@@ -579,44 +594,88 @@ if [[ "$SKIP_SYSTEM" != "1" ]]; then
 fi
 
 # ==================================================================== node ==
+# The newest Node on both releases, from NodeSource: Ubuntu's own is a major or
+# more behind (24.04 has 18, 26.04 has 22). NODE_MAJOR picks the line:
+#   lts      the newest LTS major in nodejs.org's release index (the default)
+#   current  the newest major, LTS or not
+#   <n>      exactly that major
+# The source is rewritten on every run, not only when Node is missing — the
+# cleanup above removed it — so apt keeps Node patched, and a re-run moves up a
+# major as soon as nodejs.org lists one. An installed newer major is kept.
 if [[ "$SKIP_NODE" != "1" ]]; then
-  cur_node="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
-  [[ "$cur_node" =~ ^[0-9]+$ ]] || cur_node=0
-  distro_node="$(apt_cand nodejs | cut -d. -f1)"
-  [[ "$distro_node" =~ ^[0-9]+$ ]] || distro_node=0
+  if [[ "$NODE_MAJOR" != lts && "$NODE_MAJOR" != current && ! "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
+    warn "NODE_MAJOR='${NODE_MAJOR}' is not lts, current or a major number — using lts"
+    NODE_MAJOR=lts
+  fi
+  node_major="$NODE_MAJOR"
+  [[ "$node_major" =~ ^[0-9]+$ ]] || node_major="$(curl -fsSL --max-time 30 https://nodejs.org/dist/index.json 2>/dev/null \
+    | jq -r --arg ch "$NODE_MAJOR" \
+        'map(select($ch == "current" or .lts))[0].version // empty | ltrimstr("v") | split(".")[0]' 2>/dev/null)"
+  # dpkg, not `node --version`: an nvm or mise node on PATH is not ours.
+  node_have=0
+  pkg_installed nodejs && node_have="$(dpkg-query -W -f='${Version}' nodejs | cut -d. -f1)"
+  [[ "$node_have" =~ ^[0-9]+$ ]] || node_have=0
+  if [[ -z "$node_major" ]]; then
+    warn "could not read the Node release index from nodejs.org"
+    node_major="$node_have"            # still put the installed major's source back
+  fi
+  (( node_have > node_major )) && node_major="$node_have"
 
-  if (( cur_node >= NODE_MAJOR )); then
-    log "Node.js v$(node --version | sed 's/^v//') already present"
-  elif (( distro_node >= NODE_MAJOR )); then
-    # 26.04 ships a current Node; no third-party repo needed.
-    log "Installing Node.js ${distro_node}.x from Ubuntu ${OS_VER}"
-    soft "nodejs (distro)" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm
-  else
-    # 24.04 ships 18.x, which is EOL — use NodeSource.
-    log "Ubuntu ${OS_VER} offers Node ${distro_node}.x; installing ${NODE_MAJOR}.x from NodeSource"
-    if fetch_keys /etc/apt/keyrings/nodesource.asc \
+  if (( node_major == 0 )); then
+    note_fail "nodejs"
+  elif ! curl -fsI --max-time 20 \
+         "https://deb.nodesource.com/node_${node_major}.x/dists/nodistro/InRelease" >/dev/null 2>&1; then
+    warn "NodeSource has no node_${node_major}.x repo (yet)"; note_fail "nodejs"
+  elif ! fetch_keys /etc/apt/keyrings/nodesource.asc \
          https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key; then
-      if add_repo /etc/apt/sources.list.d/nodesource.sources \
-           "https://deb.nodesource.com/node_${NODE_MAJOR}.x" nodistro main \
-           /etc/apt/keyrings/nodesource.asc; then
-        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-        soft "nodejs (NodeSource)" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
-      fi
-    else
-      warn "could not fetch the NodeSource key"; note_fail "nodejs"
-    fi
+    warn "could not fetch the NodeSource key"; note_fail "nodejs"
+  else
+    log "Node.js ${node_major}.x from NodeSource (NODE_MAJOR=${NODE_MAJOR})"
+    add_repo /etc/apt/sources.list.d/nodesource.sources \
+      "https://deb.nodesource.com/node_${node_major}.x" nodistro main \
+      /etc/apt/keyrings/nodesource.asc || true
+    sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
+    # Ubuntu's Node packages, if an older run installed them, go in the same
+    # transaction: NodeSource's nodejs conflicts with npm, but shares files
+    # with libnode-dev (/usr/include/node) and node-corepack (/usr/bin/corepack)
+    # without saying so, and dpkg aborts mid-unpack on those.
+    node_drop=()
+    for p in npm libnode-dev node-corepack; do
+      pkg_installed "$p" && node_drop+=("${p}-")
+    done
+    soft "nodejs ${node_major}.x" sudo DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y -qq nodejs "${node_drop[@]}" \
+      && sub "node $(/usr/bin/node --version 2>/dev/null)"
   fi
 
   if have npm; then
     npm config set prefix "$HOME/.local" >/dev/null 2>&1 || true
     npm config set fund false >/dev/null 2>&1 || true
-    log "Installing global npm tooling"
+    log "Installing / updating global npm tooling"
     # pyright and typescript-language-server are here for a reason: the
     # pyright-lsp / typescript-lsp plugins only *declare* the server command,
     # they never install it. Without these two the plugins load and do nothing.
-    npm install -g --silent npm@latest typescript ts-node tsx eslint prettier \
-      typescript-language-server pyright pnpm \
-      nodemon pm2 mssql @ast-grep/cli 2>/dev/null || warn "some npm globals failed"
+    # typescript stays on 6: 7 is the native compiler and ships no tsserver.js,
+    # so outside a project with its own typescript the language server falls
+    # back to the global one and exits ("Could not find a valid TypeScript").
+    # shortcut: typescript pinned to 6; move to latest once typescript-language-server runs on 7.
+    # yarn: Node 26 ships no corepack, so `yarn` has to come from npm.
+    NPM_GLOBALS=(npm@latest pnpm yarn typescript@6 tsx typescript-language-server pyright
+                 eslint prettier npm-check-updates nodemon pm2 mssql @ast-grep/cli)
+    # Globals an older version of this script installed and this one does not:
+    # removed, so a re-run lands on NPM_GLOBALS rather than on whatever piled up.
+    NPM_RETIRED=(ts-node)
+    for p in "${NPM_RETIRED[@]}"; do
+      [[ -d "$HOME/.local/lib/node_modules/$p" ]] || continue
+      npm uninstall -g --silent "$p" >/dev/null 2>&1 && sub "removed retired global: $p"
+    done
+    if ! npm install -g --silent "${NPM_GLOBALS[@]}" 2>/dev/null; then
+      # npm installs all or nothing, so one bad package would cost every other.
+      warn "bulk npm install failed — retrying one by one"
+      for p in "${NPM_GLOBALS[@]}"; do
+        npm install -g --silent "$p" >/dev/null 2>&1 || { warn "  could not install: $p"; note_fail "npm:$p"; }
+      done
+    fi
     # @ast-grep/cli ships as both `ast-grep` and `sg`. The latter shadows
     # /usr/bin/sg (the setgid helper) in interactive shells — harmless, but
     # worth knowing; scripts still get the system one.
@@ -635,7 +694,9 @@ if [[ "$SKIP_PYTHON" != "1" ]]; then
     log "Installing pipx tools"
     pipx ensurepath >/dev/null 2>&1 || true
     for pkg in ruff black isort ipython httpie sqlfluff pre-commit pgcli; do
-      pipx install "$pkg" >/dev/null 2>&1 || pipx upgrade "$pkg" >/dev/null 2>&1 \
+      # Upgrade first: `pipx install` of a tool that is already there changes
+      # nothing and still exits 0, so it never reached the upgrade.
+      pipx upgrade "$pkg" >/dev/null 2>&1 || pipx install "$pkg" >/dev/null 2>&1 \
         || { warn "pipx: $pkg failed"; note_fail "pipx:$pkg"; }
     done
     # harlequin: a TUI SQL IDE. The postgres adapter comes as an extra, the
@@ -715,15 +776,15 @@ fi
 
 # ============================================================ openai codex ==
 # An npm global (OpenAI's install channel besides Homebrew), so it lands in
-# ~/.local/bin like the other npm tools and `npm update -g @openai/codex`
-# upgrades it. That makes it depend on the node section — with SKIP_NODE=1 on
-# a box without npm there is nothing to install with, and the run says so.
+# ~/.local/bin like the other npm tools and every re-run upgrades it. That
+# makes it depend on the node section — with SKIP_NODE=1 on a box without npm
+# there is nothing to install with, and the run says so.
 if [[ "$INSTALL_CODEX" == "1" ]]; then
-  if have codex || [[ -x "$HOME/.local/bin/codex" ]]; then
-    log "OpenAI Codex already present ($("$HOME/.local/bin/codex" --version 2>/dev/null | awk '{print $NF}'))"
-  elif have npm; then
-    log "Installing OpenAI Codex (npm global, per-user)"
+  if have npm; then
+    log "Installing / updating OpenAI Codex (npm global, per-user)"
     soft "openai-codex" npm install -g --silent @openai/codex || true
+  elif have codex || [[ -x "$HOME/.local/bin/codex" ]]; then
+    log "OpenAI Codex already present ($("$HOME/.local/bin/codex" --version 2>/dev/null | awk '{print $NF}')) — no npm to update it with"
   else
     warn "OpenAI Codex is installed via npm, and npm is missing — re-run without SKIP_NODE=1"
     note_fail "openai-codex"
@@ -763,7 +824,20 @@ gh_asset_url() {
 # gh_bin <repo> <asset-regex> <binary> [binary...]
 gh_bin() {
   local repo="$1" re="$2"; shift 2
-  local main="$1" url tmpd file rc=0 b found
+  local main="$1" url tmpd file rc=0 b found owner
+  # Packaged in /usr/bin by a repo apt follows (this release carries it, or
+  # the box was upgraded to one that does): apt keeps it current, and a copy of
+  # ours in ~/.local/bin only hides it and goes stale. The copy goes, and
+  # nothing is downloaded — not even with DEV_EXTRAS_UPGRADE=1.
+  if owner="$(dpkg-query -S "/usr/bin/$main" 2>/dev/null)" \
+     && [[ -n "$(apt-cache madison "${owner%%:*}" 2>/dev/null)" ]]; then
+    for b in "$@"; do
+      [[ -f "$HOME/.local/bin/$b" && ! -L "$HOME/.local/bin/$b" ]] || continue
+      rm -f "$HOME/.local/bin/$b"
+      sub "removed ~/.local/bin/$b — ${owner%%:*} from apt replaces it"
+    done
+    sub "$(printf '%-11s' "$main") from apt (${owner%%:*})"; return 0
+  fi
   if [[ "$DEV_EXTRAS_UPGRADE" != "1" ]] && have "$main"; then
     sub "$(printf '%-11s' "$main") already present"; return 0
   fi
@@ -863,12 +937,21 @@ fi
 # releases, and tracks new Ubuntu versions within weeks. Until it does (or if
 # the repo is unreachable) Ubuntu's own docker.io + docker-compose-v2 serve —
 # same CLI, slightly older.
+#
+# An installed docker-ce gets Docker's source back on every run (the cleanup
+# above removed it), so `apt upgrade` keeps it current. It is not upgraded
+# here: that restarts dockerd, and every running container with it.
 if [[ "$SKIP_DOCKER" != "1" ]]; then
-  if have docker; then
+  docker_ce=0; pkg_installed docker-ce && docker_ce=1
+  if have docker && (( ! docker_ce )); then
     log "Docker already present ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,))"
   else
     docker_done=0
-    log "Installing Docker"
+    if (( docker_ce )); then
+      log "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,) — keeping download.docker.com configured"
+    else
+      log "Installing Docker"
+    fi
     if curl -fsI --max-time 20 \
          "https://download.docker.com/linux/ubuntu/dists/${OS_CODE}/InRelease" >/dev/null 2>&1 \
        && fetch_keys /etc/apt/keyrings/docker.asc https://download.docker.com/linux/ubuntu/gpg; then
@@ -877,7 +960,9 @@ if [[ "$SKIP_DOCKER" != "1" ]]; then
            /etc/apt/keyrings/docker.asc; then
         sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
       fi
-      if apt_installable docker-ce; then
+      if (( docker_ce )); then
+        docker_done=1                    # installed; the source was all it lacked
+      elif apt_installable docker-ce; then
         sub "docker-ce $(apt_cand docker-ce) from download.docker.com (${OS_CODE})"
         soft "docker-ce" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
           docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
@@ -890,7 +975,7 @@ if [[ "$SKIP_DOCKER" != "1" ]]; then
     else
       sub "download.docker.com has no ${OS_CODE} suite yet"
     fi
-    if (( ! docker_done )); then
+    if (( ! docker_done && ! docker_ce )); then
       sub "installing Ubuntu's docker.io ($(apt_cand docker.io)) with compose v2 and buildx"
       soft "docker.io" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         docker.io docker-compose-v2 docker-buildx || true
@@ -1619,6 +1704,8 @@ command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init bash)"
 command -v direnv >/dev/null 2>&1 && eval "$(direnv hook bash)"
 # mise: per-project tool versions from .mise.toml / .tool-versions / .nvmrc.
 # Inert until a project pins something — the apt node and dotnet stay default.
+# mise no longer reads .nvmrc / .node-version unless told to.
+export MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS="${MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS:-node}"
 command -v mise >/dev/null 2>&1 && eval "$(mise activate bash)"
 # watchexec: `wx -e cs dotnet test`, `wx -r -- npm start`. It honours
 # .gitignore, which is what entr never did.
@@ -2521,7 +2608,7 @@ FASTFETCH
 
 -- shortcuts
 \set version 'select version();'
-\set activity 'select pid, age(clock_timestamp(), query_start) as age, usename, state, left(query, 80) as query from pg_stat_activity where query != \'<IDLE>\' and query not ilike \'%pg_stat_activity%\' order by age desc;'
+\set activity 'select pid, age(clock_timestamp(), query_start) as age, usename, state, left(query, 80) as query from pg_stat_activity where state <> \'idle\' and pid <> pg_backend_pid() order by age desc nulls last;'
 \set locks 'select l.pid, d.datname, l.mode, l.granted, left(a.query, 60) as query from pg_locks l join pg_stat_activity a using (pid) left join pg_database d on d.oid = l.database order by l.pid;'
 \set dbsize 'select datname, pg_size_pretty(pg_database_size(datname)) as size from pg_database order by pg_database_size(datname) desc;'
 \set tablesize 'select schemaname, relname, pg_size_pretty(pg_total_relation_size(relid)) as total from pg_catalog.pg_statio_user_tables order by pg_total_relation_size(relid) desc limit 25;'
@@ -2624,7 +2711,8 @@ if have delta; then
   gitset delta.line-numbers true
   gitset delta.hyperlinks false
   gitset delta.dark true
-  if delta --list-syntax-themes 2>/dev/null | grep -qx "Catppuccin Mocha"; then
+  # Listed as "dark<TAB>Catppuccin Mocha", so a whole-line match never hits.
+  if delta --list-syntax-themes 2>/dev/null | awk -F'\t' '$NF == "Catppuccin Mocha" {f=1} END {exit !f}'; then
     gitset delta.syntax-theme "Catppuccin Mocha"
   else
     gitset delta.syntax-theme "OneHalfDark"
@@ -2767,7 +2855,7 @@ ms_pool_install() {
   local debs=()
   for pkg in msodbcsql18 mssql-tools18; do
     # Skip the driver when it is already installed — see ms_apt_install.
-    [[ "$pkg" == msodbcsql18 ]] && dpkg -s msodbcsql18 >/dev/null 2>&1 && continue
+    [[ "$pkg" == msodbcsql18 ]] && pkg_installed msodbcsql18 && continue
     if ! line="$(ms_newest "$idx" "$pkg")"; then
       warn "${pkg} is not in the pool index"; rc=1; break
     fi
@@ -2789,65 +2877,71 @@ ms_pool_install() {
 }
 
 if [[ "$SKIP_MSSQL" != "1" ]]; then
-  ms_done=0
+  # An installed copy still goes through the probe and route 2: the cleanup
+  # above removed its source, and route 2 is what puts it back so apt keeps it
+  # patched. Route 3 and go-sqlcmd are only for a missing sqlcmd.
+  ms_done=0; ms_have=0
   if [[ -x "$MS_BIN/sqlcmd" ]]; then
-    log "sqlcmd already installed"
+    log "sqlcmd already installed — putting its apt source back"
     sub "$MS_BIN/sqlcmd  ($(dpkg-query -W -f='${Version}' mssql-tools18 2>/dev/null || echo 'not from a package'))"
-    ms_done=1
+    ms_have=1
   else
     log "Installing the Microsoft SQL tooling"
-    ms_eula_preseed
+  fi
+  ms_eula_preseed
 
-    # ---- route 1: a Microsoft repo that is already configured here ----------
-    if apt_installable mssql-tools18; then
-      sub "already reachable from a configured repo (candidate $(apt_cand mssql-tools18))"
-      ms_apt_install mssql-tools18 && ms_done=1
-      (( ms_done )) || warn "that repo could not deliver the package — trying the other routes"
-    fi
+  # ---- route 1: a Microsoft repo that is already configured here ----------
+  # Not for an installed copy: apt offers that as its own candidate even with
+  # no source behind it, which would pass for "reachable" here.
+  if (( ! ms_have )) && apt_installable mssql-tools18; then
+    sub "already reachable from a configured repo (candidate $(apt_cand mssql-tools18))"
+    ms_apt_install mssql-tools18 && ms_done=1
+    (( ms_done )) || warn "that repo could not deliver the package — trying the other routes"
+  fi
 
-    # ---- probe: which suite actually carries the packages? ------------------
-    # Asked over plain HTTPS, so a broken apt configuration cannot produce a
-    # false negative, and the index we get is reused by route 3.
-    ms_base=""; ms_idx=""; ms_suite=""; ms_relver=""; ms_tried=" "
-    if (( ! ms_done )); then
-      ms_probe="$(mktemp)"
-      for pair in "${OS_VER}:${OS_CODE}" "25.10:questing" "24.04:noble" "22.04:jammy"; do
-        p_ver="${pair%%:*}"; p_suite="${pair##*:}"
-        [[ -z "$p_ver" || -z "$p_suite" ]] && continue
-        [[ "$ms_tried" == *" ${p_ver}/${p_suite} "* ]] && continue
-        ms_tried+="${p_ver}/${p_suite} "
-        printf '    %-16s ' "${p_ver}/${p_suite}"
-        if ! curl -fsSL --max-time 60 -o "$ms_probe" \
-             "https://packages.microsoft.com/ubuntu/${p_ver}/prod/dists/${p_suite}/main/binary-${ARCH}/Packages" 2>/dev/null; then
-          echo "no package index"; continue
-        fi
-        ms_t="$(grep -c '^Package: mssql-tools18$' "$ms_probe")"
-        ms_o="$(grep -c '^Package: msodbcsql18$'  "$ms_probe")"
-        echo "mssql-tools18=${ms_t} msodbcsql18=${ms_o}"
-        (( ms_t > 0 && ms_o > 0 )) || continue
-        ms_relver="$p_ver"; ms_suite="$p_suite"
-        ms_base="https://packages.microsoft.com/ubuntu/${p_ver}/prod"
-        ms_idx="$(mktemp)"; cp "$ms_probe" "$ms_idx"
-        break
-      done
-      rm -f "$ms_probe"
-      [[ -n "$ms_base" && "$ms_relver" != "$OS_VER" ]] && \
-        warn "Microsoft has no Ubuntu ${OS_VER} build — using the ${ms_relver} (${ms_suite}) packages"
-    fi
+  # ---- probe: which suite actually carries the packages? ------------------
+  # Asked over plain HTTPS, so a broken apt configuration cannot produce a
+  # false negative, and the index we get is reused by route 3.
+  ms_base=""; ms_idx=""; ms_suite=""; ms_relver=""; ms_tried=" "
+  if (( ! ms_done )); then
+    ms_probe="$(mktemp)"
+    for pair in "${OS_VER}:${OS_CODE}" "25.10:questing" "24.04:noble" "22.04:jammy"; do
+      p_ver="${pair%%:*}"; p_suite="${pair##*:}"
+      [[ -z "$p_ver" || -z "$p_suite" ]] && continue
+      [[ "$ms_tried" == *" ${p_ver}/${p_suite} "* ]] && continue
+      ms_tried+="${p_ver}/${p_suite} "
+      printf '    %-16s ' "${p_ver}/${p_suite}"
+      if ! curl -fsSL --max-time 60 -o "$ms_probe" \
+           "https://packages.microsoft.com/ubuntu/${p_ver}/prod/dists/${p_suite}/main/binary-${ARCH}/Packages" 2>/dev/null; then
+        echo "no package index"; continue
+      fi
+      ms_t="$(grep -c '^Package: mssql-tools18$' "$ms_probe")"
+      ms_o="$(grep -c '^Package: msodbcsql18$'  "$ms_probe")"
+      echo "mssql-tools18=${ms_t} msodbcsql18=${ms_o}"
+      (( ms_t > 0 && ms_o > 0 )) || continue
+      ms_relver="$p_ver"; ms_suite="$p_suite"
+      ms_base="https://packages.microsoft.com/ubuntu/${p_ver}/prod"
+      ms_idx="$(mktemp)"; cp "$ms_probe" "$ms_idx"
+      break
+    done
+    rm -f "$ms_probe"
+    [[ -n "$ms_base" && "$ms_relver" != "$OS_VER" ]] && \
+      warn "Microsoft has no Ubuntu ${OS_VER} build — using the ${ms_relver} (${ms_suite}) packages"
+  fi
 
-    # ---- route 2: our own source for that suite -----------------------------
-    if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
-      if fetch_keys /etc/apt/keyrings/microsoft.asc \
-           https://packages.microsoft.com/keys/microsoft.asc \
-           https://packages.microsoft.com/keys/microsoft-2025.asc; then
-        if add_repo /etc/apt/sources.list.d/mssql-release.sources \
-             "$ms_base" "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
-          # A repo for another release must not become a general-purpose source:
-          # noble/prod alone carries ~100 packages (powershell, moby, kubectl)
-          # built for the wrong Ubuntu. Pin the whole suite out of reach and let
-          # only the two SQL packages back through.
-          if [[ "$ms_suite" != "$OS_CODE" ]]; then
-            sudo tee /etc/apt/preferences.d/mssql-release.pref >/dev/null <<EOF
+  # ---- route 2: our own source for that suite -----------------------------
+  if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
+    if fetch_keys /etc/apt/keyrings/microsoft.asc \
+         https://packages.microsoft.com/keys/microsoft.asc \
+         https://packages.microsoft.com/keys/microsoft-2025.asc; then
+      if add_repo /etc/apt/sources.list.d/mssql-release.sources \
+           "$ms_base" "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
+        # A repo for another release must not become a general-purpose source:
+        # noble/prod alone carries ~100 packages (powershell, moby, kubectl)
+        # built for the wrong Ubuntu. Pin the whole suite out of reach and let
+        # only the two SQL packages back through.
+        if [[ "$ms_suite" != "$OS_CODE" ]]; then
+          sudo tee /etc/apt/preferences.d/mssql-release.pref >/dev/null <<EOF
 ${MANAGED}
 Package: *
 Pin: release n=${ms_suite}
@@ -2857,45 +2951,51 @@ Package: msodbcsql18 mssql-tools18
 Pin: release n=${ms_suite}
 Pin-Priority: 500
 EOF
-            sub "pinned: only msodbcsql18/mssql-tools18 may come from ${ms_suite}"
-          fi
-          sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-          if apt_installable mssql-tools18; then
-            sub "candidate $(apt_cand mssql-tools18) from ${ms_relver}/${ms_suite}"
-            ms_apt_install mssql-tools18 && ms_done=1
-          else
-            warn "the ${ms_suite} source produced no installable candidate — removing it again"
-            sudo rm -f /etc/apt/sources.list.d/mssql-release.sources \
-                       /etc/apt/preferences.d/mssql-release.pref
-            sudo apt-get update -qq >/dev/null 2>&1 || true
-          fi
+          sub "pinned: only msodbcsql18/mssql-tools18 may come from ${ms_suite}"
         fi
-      else
-        warn "could not download the Microsoft signing keys"
+        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
+        if apt_installable mssql-tools18; then
+          sub "candidate $(apt_cand mssql-tools18) from ${ms_relver}/${ms_suite}"
+          ms_apt_install mssql-tools18 && ms_done=1
+        else
+          warn "the ${ms_suite} source produced no installable candidate — removing it again"
+          sudo rm -f /etc/apt/sources.list.d/mssql-release.sources \
+                     /etc/apt/preferences.d/mssql-release.pref
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+        fi
       fi
+    else
+      warn "could not download the Microsoft signing keys"
     fi
+  fi
 
-    # ---- route 3: the .deb files straight from the pool ---------------------
-    if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
-      warn "repo route did not work — installing the .deb files from the pool"
-      ms_pool_install "$ms_base" "$ms_idx" && ms_done=1
-    fi
-    [[ -n "$ms_idx" ]] && rm -f "$ms_idx"
+  # ---- route 3: the .deb files straight from the pool ---------------------
+  if (( ! ms_done && ! ms_have )) && [[ -n "$ms_base" ]]; then
+    warn "repo route did not work — installing the .deb files from the pool"
+    ms_pool_install "$ms_base" "$ms_idx" && ms_done=1
+  fi
+  [[ -n "$ms_idx" ]] && rm -f "$ms_idx"
 
-    # ---- last resort: go-sqlcmd --------------------------------------------
-    if (( ! ms_done )); then
-      [[ -n "$ms_base" ]] || warn "no Microsoft repo carries mssql-tools18 for ${ARCH}"
-      warn "falling back to go-sqlcmd (static binary: sqlcmd only — no bcp, no ODBC driver)"
-      if curl -fsSL --max-time 300 \
-           "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2" \
-           | tar xj -C "$HOME/.local/bin" sqlcmd 2>/dev/null; then
-        sub "installed $HOME/.local/bin/sqlcmd"
-        note_fail "mssql-tools18 (go-sqlcmd installed instead)"
-      else
-        warn "that failed too — this machine has no sqlcmd"
-        note_fail "mssql-tools18"
-      fi
+  # ---- last resort: go-sqlcmd --------------------------------------------
+  if (( ! ms_done && ! ms_have )); then
+    [[ -n "$ms_base" ]] || warn "no Microsoft repo carries mssql-tools18 for ${ARCH}"
+    warn "falling back to go-sqlcmd (static binary: sqlcmd only — no bcp, no ODBC driver)"
+    if curl -fsSL --max-time 300 \
+         "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2" \
+         | tar xj -C "$HOME/.local/bin" sqlcmd 2>/dev/null; then
+      sub "installed $HOME/.local/bin/sqlcmd"
+      note_fail "mssql-tools18 (go-sqlcmd installed instead)"
+    else
+      warn "that failed too — this machine has no sqlcmd"
+      note_fail "mssql-tools18"
     fi
+  fi
+
+  # The go-sqlcmd fallback from an earlier run would hide the real sqlcmd:
+  # rc.sh puts ~/.local/bin first on PATH and /opt/mssql-tools18/bin last.
+  if [[ -x "$MS_BIN/sqlcmd" && -f "$HOME/.local/bin/sqlcmd" && ! -L "$HOME/.local/bin/sqlcmd" ]]; then
+    rm -f "$HOME/.local/bin/sqlcmd"
+    sub "removed the go-sqlcmd fallback from ~/.local/bin — mssql-tools18 replaces it"
   fi
 
   # /opt/mssql-tools18/bin is on no one's PATH by default; rc.sh appends it when
@@ -2915,32 +3015,46 @@ fi
 # ============================================================== postgres ====
 # PGDG carries a new Ubuntu release only some months after launch, so probe
 # before trusting it. Ubuntu 26.04's own client is current anyway.
+#
+# The PGDG source is rewritten on every run, not only when psql is missing —
+# the cleanup above removed it — so apt keeps the client and libpq patched.
+# PG_MAJOR empty takes the newest client on offer: pg_dump refuses to dump a
+# server newer than itself, so the newest client works against every server.
 if [[ "$SKIP_POSTGRES" != "1" ]]; then
-  if have psql; then
-    log "psql $(psql --version | awk '{print $3}') already present"
-  else
-    pg_suite="${OS_CODE}-pgdg"
-    if curl -fsI --max-time 20 \
-         "https://apt.postgresql.org/pub/repos/apt/dists/${pg_suite}/InRelease" >/dev/null 2>&1 \
-       && fetch_keys /etc/apt/keyrings/pgdg.asc \
-            https://www.postgresql.org/media/keys/ACCC4CF8.asc; then
-      log "Installing PostgreSQL client ${PG_MAJOR} (PGDG ${pg_suite})"
-      if add_repo /etc/apt/sources.list.d/pgdg.sources \
-           "https://apt.postgresql.org/pub/repos/apt" "$pg_suite" main \
-           /etc/apt/keyrings/pgdg.asc; then
-        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-      fi
-      if apt_installable "postgresql-client-${PG_MAJOR}"; then
-        soft "postgresql-client-${PG_MAJOR}" sudo DEBIAN_FRONTEND=noninteractive \
-          apt-get install -y -qq "postgresql-client-${PG_MAJOR}" libpq-dev || true
-      else
-        warn "PGDG has no client ${PG_MAJOR} here — using Ubuntu's"
-        soft "postgresql-client" sudo apt-get install -y -qq postgresql-client libpq-dev || true
-      fi
-    else
-      log "No PGDG repo for ${OS_CODE} — using Ubuntu's postgresql-client ($(apt_cand postgresql-client))"
-      soft "postgresql-client" sudo apt-get install -y -qq postgresql-client libpq-dev || true
+  pg_suite="${OS_CODE}-pgdg"
+  if curl -fsI --max-time 20 \
+       "https://apt.postgresql.org/pub/repos/apt/dists/${pg_suite}/InRelease" >/dev/null 2>&1 \
+     && fetch_keys /etc/apt/keyrings/pgdg.asc \
+          https://www.postgresql.org/media/keys/ACCC4CF8.asc; then
+    if add_repo /etc/apt/sources.list.d/pgdg.sources \
+         "https://apt.postgresql.org/pub/repos/apt" "$pg_suite" main \
+         /etc/apt/keyrings/pgdg.asc; then
+      sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
     fi
+    pg_pkg="postgresql-client-${PG_MAJOR}"
+    [[ -n "$PG_MAJOR" ]] || pg_pkg="$(apt-cache pkgnames postgresql-client- 2>/dev/null \
+                                      | grep -E '^postgresql-client-[0-9]+$' | sort -V | tail -1)"
+    if [[ -n "$pg_pkg" ]] && apt_installable "$pg_pkg"; then
+      log "PostgreSQL client: ${pg_pkg} (PGDG ${pg_suite})"
+      soft "$pg_pkg" sudo DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y -qq "$pg_pkg" libpq-dev || true
+      # Older clients are superseded, not deleted: marked automatic, they go with
+      # the next `apt autoremove` — unless a local server of that major needs them.
+      for p in $(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'postgresql-client-[0-9]*' 2>/dev/null \
+                 | awk '$1 == "installed" {print $2}'); do
+        [[ "$p" == "$pg_pkg" ]] || sudo apt-mark auto "$p" >/dev/null 2>&1
+      done
+    else
+      warn "PGDG has no ${pg_pkg:-postgresql-client} here — using Ubuntu's"
+      soft "postgresql-client" sudo DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y -qq postgresql-client libpq-dev || true
+    fi
+  elif have psql; then
+    log "psql $(psql --version | awk '{print $3}') already present (no PGDG repo for ${OS_CODE})"
+  else
+    log "No PGDG repo for ${OS_CODE} — using Ubuntu's postgresql-client ($(apt_cand postgresql-client))"
+    soft "postgresql-client" sudo DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y -qq postgresql-client libpq-dev || true
   fi
 fi
 
@@ -2987,13 +3101,13 @@ if [[ "$SKIP_HARDENING" != "1" ]]; then
   log "Hardening: unattended-upgrades, fail2ban, ufw"
   hard_pkgs=()
   for p in unattended-upgrades fail2ban ufw; do
-    dpkg -s "$p" >/dev/null 2>&1 || { apt_has "$p" && hard_pkgs+=("$p"); }
+    pkg_installed "$p" || { apt_has "$p" && hard_pkgs+=("$p"); }
   done
   (( ${#hard_pkgs[@]} )) && soft "hardening packages" sudo DEBIAN_FRONTEND=noninteractive \
     apt-get install -y -qq --no-install-recommends "${hard_pkgs[@]}"
 
   # ---- unattended-upgrades -------------------------------------------------
-  if dpkg -s unattended-upgrades >/dev/null 2>&1; then
+  if pkg_installed unattended-upgrades; then
     printf '%s\n' \
       "// ${MANAGED#\# }" \
       'APT::Periodic::Update-Package-Lists "1";' \
@@ -3007,7 +3121,7 @@ if [[ "$SKIP_HARDENING" != "1" ]]; then
   # ---- fail2ban ------------------------------------------------------------
   # backend=systemd: Ubuntu ships no rsyslog any more, so /var/log/auth.log is
   # often missing and the stock jail then refuses to start.
-  if dpkg -s fail2ban >/dev/null 2>&1; then
+  if pkg_installed fail2ban; then
     sudo tee /etc/fail2ban/jail.d/dev-bootstrap-sshd.local >/dev/null <<EOF
 ${MANAGED}
 [DEFAULT]
@@ -3069,6 +3183,83 @@ if [[ -d "$DEV_ROOT" ]] && getent group "$DEV_GROUP" >/dev/null 2>&1; then
   fi
 fi
 
+# ============================================================== leftovers ===
+# What nothing uses any more goes, so every run lands on the same clean box:
+#   * dangling links in ~/.local/bin — an npm or pipx tool removed under them
+#   * packages apt pulled in only for something since removed (Ubuntu's npm
+#     and its node-* libraries, old kernels, a superseded psql client):
+#     `apt autoremove --purge`
+#   * what removed kernels and Node packages left behind (dpkg state "rc")
+#
+# Kept whatever apt thinks of them, because purging them destroys data: a
+# database server (postgresql-NN deletes its clusters on purge — the debconf
+# default is yes) and Docker (purging docker.io wipes /var/lib/docker, volumes
+# included). The bootloader stays too: purging grub-pc deletes
+# /etc/default/grub, which grub-efi reads as well. Other "rc" leftovers were
+# removed by someone, by hand, and may hold data of their own — listed, not
+# purged. SKIP_AUTOREMOVE=1 lists the apt part and changes nothing.
+LEFTOVER_KEEP_RE='^(postgresql-[0-9]+|mysql-server.*|mariadb-server.*|mssql-server|redis-server|mongodb.*|docker.*|containerd.*|grub.*|shim.*)$'
+LEFTOVER_PURGE_RE='^(linux-.*|npm|libnode.*|node-.*|libjs-.*|javascript-common)$'
+apt_orphans() { apt-get -s autoremove 2>/dev/null | awk '/^Remv /{sub(/:.*/, "", $2); print $2}'; }
+list12() {                     # list12 <lines> -> "N: a b c ..." on one line
+  local n; n="$(wc -l <<<"$1")"
+  printf '%s: %s%s' "$n" "$(head -12 <<<"$1" | tr '\n' ' ')" "$( (( n > 12 )) && echo '...')"
+}
+
+log "Removing what nothing uses any more"
+left_n=0
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  rm -f "$f"; sub "removed dangling link $(hp "$f")"; left_n=$((left_n+1))
+done < <(find "$HOME/.local/bin" -maxdepth 1 -xtype l 2>/dev/null)
+
+orphans="$(apt_orphans)"
+orph_keep="$(grep -E "$LEFTOVER_KEEP_RE" <<<"$orphans")"
+if [[ -n "$orph_keep" ]]; then
+  warn "kept, though nothing needs them: $(tr '\n' ' ' <<<"$orph_keep")— data or boot"
+  sub "if you mean it: sudo apt remove <name> (remove, not purge — purge deletes their data)"
+  # Manual from here on: autoremove leaves them alone, now and on later runs.
+  mapfile -t keep_pkgs <<<"$orph_keep"
+  [[ "$SKIP_AUTOREMOVE" == "1" ]] || sudo apt-mark manual "${keep_pkgs[@]}" >/dev/null 2>&1
+  orphans="$(apt_orphans)"
+  left_n=$((left_n+1))
+fi
+orph_show="$(grep -vE "$LEFTOVER_KEEP_RE" <<<"$orphans")"
+if [[ -n "$orph_show" ]]; then
+  sub "unused packages $(list12 "$orph_show")"
+  if [[ "$SKIP_AUTOREMOVE" == "1" ]]; then
+    # No command to copy: by hand, autoremove --purge would take the kept ones too.
+    sub "SKIP_AUTOREMOVE=1 — left in place"
+  elif grep -qE "$LEFTOVER_KEEP_RE" <<<"$orphans"; then
+    # apt-mark did not take: autoremove would purge what we just promised to keep.
+    warn "could not protect the packages above — not running autoremove"; note_fail "autoremove"
+  else
+    soft "apt autoremove" sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -qq \
+      && sub "removed and purged"
+  fi
+  left_n=$((left_n+1))
+fi
+
+residue="$(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null | awk '$1 == "rc" {print $2}')"
+res_purge="$(grep -E "$LEFTOVER_PURGE_RE" <<<"$residue")"
+res_held="$(grep -vE "$LEFTOVER_PURGE_RE" <<<"$residue")"
+if [[ -n "$res_purge" ]]; then
+  sub "config left by removed kernels / Node packages $(list12 "$res_purge")"
+  if [[ "$SKIP_AUTOREMOVE" == "1" ]]; then
+    sub "SKIP_AUTOREMOVE=1 — left in place"
+  else
+    mapfile -t purge_pkgs <<<"$res_purge"
+    soft "purge leftover config" sudo dpkg --purge "${purge_pkgs[@]}" >/dev/null 2>&1 && sub "purged"
+  fi
+  left_n=$((left_n+1))
+fi
+if [[ -n "$res_held" ]]; then
+  sub "removed earlier, config still on disk $(list12 "$res_held")"
+  sub "not purged for you (purging can delete data): sudo dpkg --purge <name> once you know what it keeps"
+  left_n=$((left_n+1))
+fi
+(( left_n == 0 )) && sub "nothing left over"
+
 # =============================================================== verify =====
 log "Final apt health check"
 apt_err="$(sudo apt-get update 2>&1 | grep -E '^(E|W):')"
@@ -3079,6 +3270,7 @@ if [[ -n "$apt_err" ]]; then
 else
   sub "apt update is clean"
 fi
+
 
 # The check that would have caught the silent failure this script now fixes:
 # does a real interactive LOGIN shell actually end up with our config loaded?
