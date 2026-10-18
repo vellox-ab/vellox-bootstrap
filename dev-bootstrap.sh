@@ -824,19 +824,29 @@ gh_asset_url() {
 # gh_bin <repo> <asset-regex> <binary> [binary...]
 gh_bin() {
   local repo="$1" re="$2"; shift 2
-  local main="$1" url tmpd file rc=0 b found owner
+  local main="$1" url tmpd file rc=0 b found owner copy cv av
   # Packaged in /usr/bin by a repo apt follows (this release carries it, or
-  # the box was upgraded to one that does): apt keeps it current, and a copy of
-  # ours in ~/.local/bin only hides it and goes stale. The copy goes, and
-  # nothing is downloaded — not even with DEV_EXTRAS_UPGRADE=1.
+  # the box was upgraded to one that does): apt keeps it current. A copy of
+  # ours in ~/.local/bin that is no newer only hides it, so it goes. A newer
+  # copy stays: going back a version can break data the newer one already
+  # migrated (atuin's history.db does exactly that).
   if owner="$(dpkg-query -S "/usr/bin/$main" 2>/dev/null)" \
      && [[ -n "$(apt-cache madison "${owner%%:*}" 2>/dev/null)" ]]; then
-    for b in "$@"; do
-      [[ -f "$HOME/.local/bin/$b" && ! -L "$HOME/.local/bin/$b" ]] || continue
-      rm -f "$HOME/.local/bin/$b"
-      sub "removed ~/.local/bin/$b — ${owner%%:*} from apt replaces it"
-    done
-    sub "$(printf '%-11s' "$main") from apt (${owner%%:*})"; return 0
+    owner="${owner%%:*}"; copy="$HOME/.local/bin/$main"
+    if [[ -f "$copy" && ! -L "$copy" ]]; then
+      cv="$("$copy" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+      av="$(dpkg-query -W -f='${Version}' "$owner" 2>/dev/null)"
+      if [[ -n "$cv" ]] && dpkg --compare-versions "${av#*:}" ge "$cv"; then
+        for b in "$@"; do
+          [[ -f "$HOME/.local/bin/$b" && ! -L "$HOME/.local/bin/$b" ]] || continue
+          rm -f "$HOME/.local/bin/$b"
+          sub "removed ~/.local/bin/$b — ${owner} ${av} from apt is at least as new"
+        done
+      fi
+    fi
+    if [[ ! -f "$copy" || -L "$copy" ]]; then
+      sub "$(printf '%-11s' "$main") from apt (${owner})"; return 0
+    fi
   fi
   if [[ "$DEV_EXTRAS_UPGRADE" != "1" ]] && have "$main"; then
     sub "$(printf '%-11s' "$main") already present"; return 0

@@ -29,7 +29,8 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 - **Leaves nothing unused behind.** npm globals it no longer installs
   (`NPM_RETIRED`) are uninstalled; superseded PostgreSQL clients are marked
   automatic; a GitHub-release copy in `~/.local/bin` goes once apt packages the
-  tool, and so does the go-sqlcmd fallback once `mssql-tools18` is in. The
+  tool at the same version or newer (a newer copy stays: atuin cannot go back
+  a version on a history.db it already migrated), and so does the go-sqlcmd fallback once `mssql-tools18` is in. The
   leftovers section then removes dangling links in `~/.local/bin`, runs
   `apt autoremove --purge`, and purges what removed kernels and Node packages
   left behind (dpkg state `rc`).

@@ -316,7 +316,7 @@ Everything moved aside is listed again at the end of the run.
   listed but never touched.
 - **Leaves nothing unused behind.** npm globals it no longer installs are
   uninstalled, stale copies in `~/.local/bin` go once apt (or mssql-tools18)
-  provides the real thing, and the run ends by removing dangling links,
+  provides the real thing at the same version or newer, and the run ends by removing dangling links,
   running `apt autoremove --purge`, and purging what removed kernels and Node
   packages left behind. Database servers, Docker and the bootloader are never
   removed — purging them deletes data or boot config — and other leftovers
@@ -331,4 +331,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.9.0** (see `VERSION`).
+Current version: **5.9.1** (see `VERSION`).
