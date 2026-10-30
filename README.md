@@ -61,7 +61,7 @@ NODE_MAJOR=current bash dev-bootstrap.sh     # newest Node major, not newest LTS
 | `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
-| `DEV_UFW_TRUST` | `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16` | Networks ufw allows outright and fail2ban never bans |
+| `DEV_UFW_TRUST` | empty | Networks ufw allows on every port and fail2ban never bans |
 | `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads the tools that come from GitHub releases |
 
 Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
@@ -181,10 +181,11 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
 - **Hardening** — `unattended-upgrades` for security updates, `fail2ban` on
   sshd (systemd backend, trusted ranges ignored), and `ufw` with incoming
   denied by default — SSH (on whatever port sshd really listens on) and mosh
-  open from everywhere, everything open from `DEV_UFW_TRUST`. That defaults to
-  all of RFC 1918, so a box reached over a LAN or VPN keeps its dev ports and
-  the firewall cannot lock you out. The SSH rule is added *before* the
-  firewall is enabled, and enabling is skipped if that rule failed.
+  open from everywhere, everything open from `DEV_UFW_TRUST` — empty by
+  default, so it is safe on production and any other port is opened on
+  purpose. Trusted ranges an earlier run added are removed when no longer
+  listed. The SSH rule is added *before* the firewall is enabled, and
+  enabling is skipped if that rule failed.
 - **Node.js** — the newest LTS (or `NODE_MAJOR=current` / a pinned major)
   from NodeSource on both releases, upgraded on every run, plus the latest
   npm globals: `npm`, `pnpm`, `yarn`, `typescript@6`, `tsx`,
@@ -331,4 +332,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.9.1** (see `VERSION`).
+Current version: **5.10.0** (see `VERSION`).

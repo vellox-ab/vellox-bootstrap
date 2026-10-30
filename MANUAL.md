@@ -96,7 +96,7 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | `PG_MAJOR` | empty | pin a client major; empty = newest PGDG carries |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Claude Code plugins |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | both set = no prompt |
-| `DEV_UFW_TRUST` | `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16` | networks ufw allows and fail2ban ignores |
+| `DEV_UFW_TRUST` | empty | networks ufw allows on every port and fail2ban ignores |
 | `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads every GitHub-release tool |
 
 Runtime knobs that go in `~/.config/dev-bootstrap/local.sh` (read by every
@@ -549,7 +549,7 @@ refreshes all of them.
 `tshare user:password [port]` starts `ttyd` serving the `dev` tmux session
 in a browser at `http://<ip>:7681/`, writable, with HTTP basic auth (the
 credentials are mandatory by design — it is a full shell). Reachable from the
-trusted networks only, unless you `ufw allow 7681/tcp` yourself. Ctrl-C
+`DEV_UFW_TRUST` networks only, unless you `ufw allow 7681/tcp` yourself. Ctrl-C
 stops it.
 
 ### 4.10 Claude Code
@@ -586,9 +586,13 @@ stops it.
 Installed and enabled with: default **deny incoming, allow outgoing**;
 SSH allowed on **every port sshd actually listens on** (`sshd -T`, default
 22); mosh UDP 60000–61000; and **everything allowed from each network in
-`DEV_UFW_TRUST`** (default: all of RFC 1918 — `10/8`, `172.16/12`,
-`192.168/16`). So on a box reached over a LAN or VPN the firewall only bites
-on a public interface, and dev servers on :3000/:5000/:8000 stay reachable.
+`DEV_UFW_TRUST`** — empty by default, so the script is production-safe and
+every other port is opened on purpose, e.g. for the reverse proxy:
+`sudo ufw allow from 10.4.20.25 to any port 4010 proto tcp`. To trust a
+LAN/VPN on a dev box: `DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap.sh`.
+Ranges an earlier run trusted (older versions trusted all of RFC 1918) are
+deleted on the next run if `DEV_UFW_TRUST` no longer lists them; rules you
+added yourself are never touched.
 
 Safety: the SSH rule is added *before* `ufw --force enable`, and enabling is
 skipped if it failed. An already-active ufw only gets the rules refreshed

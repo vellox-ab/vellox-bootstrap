@@ -33,8 +33,8 @@
 # Beyond the base packages it installs a set of extra tools (lazygit, atuin,
 # starship, mise, watchexec, difftastic, yazi, lnav, mosh, ttyd, ...), Docker
 # from Docker's own repo, and a light hardening pass (unattended-upgrades,
-# fail2ban, ufw). The firewall trusts the private ranges in DEV_UFW_TRUST, so a
-# box reached over a LAN or VPN is never cut off by it.
+# fail2ban, ufw). The firewall opens SSH (and mosh) only; set DEV_UFW_TRUST to
+# networks that should reach every port (none by default — production-safe).
 #
 #   SKIP_EXTRAS=1 SKIP_DOCKER=1 SKIP_HARDENING=1 bash dev-bootstrap.sh
 #   DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap.sh
@@ -104,9 +104,10 @@ SKIP_DOCKER="${SKIP_DOCKER:-0}"
 SKIP_HARDENING="${SKIP_HARDENING:-0}"   # unattended-upgrades, fail2ban, ufw
 SKIP_AUTOREMOVE="${SKIP_AUTOREMOVE:-0}" # 1 = list leftover packages, remove none
 DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
-# Networks the firewall and fail2ban trust outright: every RFC 1918 range, so a
-# LAN or VPN is never locked out. SSH is allowed from everywhere regardless.
-DEV_UFW_TRUST="${DEV_UFW_TRUST:-10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}"
+# Networks the firewall and fail2ban trust outright (every port open to them).
+# Empty by default so the script is safe on production; SSH is allowed from
+# everywhere regardless, so an empty list cannot lock you out.
+DEV_UFW_TRUST="${DEV_UFW_TRUST:-}"
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
 SKIP_CODEX="${SKIP_CODEX:-0}"
 SKIP_CLAUDE_CONF="${SKIP_CLAUDE_CONF:-0}"
@@ -1841,7 +1842,7 @@ fi
 
 # tshare user:password [port] — serve the "dev" tmux session in a browser
 # (ttyd). Credentials are required on purpose: it is a full shell. Reachable
-# on the LAN/VPN only, unless you opened the port in ufw yourself.
+# only from DEV_UFW_TRUST networks, unless you opened the port in ufw yourself.
 tshare() {
   command -v ttyd >/dev/null 2>&1 || { echo "tshare: ttyd is not installed" >&2; return 1; }
   case "${1:-}" in *:*) ;; *) echo "usage: tshare user:password [port]" >&2; return 2 ;; esac
@@ -3103,10 +3104,10 @@ fi
 #   fail2ban              bans an IP after repeated failed SSH logins
 #   ufw                   deny incoming by default; SSH (and mosh) open from
 #                         everywhere, everything open from DEV_UFW_TRUST
-# The trusted ranges default to all of RFC 1918, so dev servers on :3000/:5000
-# stay reachable over a LAN or VPN and nothing here can lock you out. Docker
-# publishes ports through its own iptables chain and bypasses ufw entirely —
-# another reason the trusted-range model, not per-port rules, is the default.
+# DEV_UFW_TRUST is empty by default, so any other port (an app, a dev server)
+# must be opened on purpose: `sudo ufw allow from <proxy-ip> to any port <p>`.
+# Docker publishes ports through its own iptables chain and bypasses ufw
+# entirely — bind containers to 127.0.0.1 unless they must be reachable.
 if [[ "$SKIP_HARDENING" != "1" ]]; then
   log "Hardening: unattended-upgrades, fail2ban, ufw"
   hard_pkgs=()
@@ -3168,14 +3169,25 @@ EOF
       sudo ufw allow from "$net" comment 'trusted (dev-bootstrap)' >/dev/null 2>&1 \
         || warn "ufw: could not add the trusted range ${net}"
     done
+    # Drop trusted ranges an earlier run added that DEV_UFW_TRUST no longer
+    # lists (older versions trusted all of RFC 1918 by default).
+    for net in $(sudo ufw show added 2>/dev/null \
+                 | awk '/^ufw allow from .*trusted \(dev-bootstrap\)/{print $4}' | sort -u); do
+      [[ " $DEV_UFW_TRUST " == *" $net "* ]] && continue
+      if sudo ufw delete allow from "$net" >/dev/null 2>&1; then
+        sub "ufw: removed the old trusted range ${net}"
+      else
+        warn "ufw: could not remove the old trusted range ${net}"
+      fi
+    done
     if (( ufw_ok )); then
       if sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
-        sub "ufw: already active — rules refreshed (ssh ${ssh_ports}tcp, trusted: ${DEV_UFW_TRUST})"
+        sub "ufw: already active — rules refreshed (ssh ${ssh_ports}tcp, trusted: ${DEV_UFW_TRUST:-none})"
       else
         sudo ufw default deny incoming  >/dev/null 2>&1
         sudo ufw default allow outgoing >/dev/null 2>&1
         if sudo ufw --force enable >/dev/null 2>&1; then
-          sub "ufw: enabled — incoming denied except ssh (${ssh_ports}tcp) and the trusted ranges"
+          sub "ufw: enabled — incoming denied except ssh (${ssh_ports}tcp), trusted: ${DEV_UFW_TRUST:-none}"
         else
           warn "ufw could not be enabled"; note_fail "ufw"
         fi
