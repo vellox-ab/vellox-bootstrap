@@ -5,7 +5,7 @@ where it lives on disk, how the pieces fit together, and how to turn each one
 off. Written so that a person — or an AI session with this repository open —
 can answer "how does X work on this machine?" without reading the scripts.
 
-Script version: **6.0.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
+Script version: **6.1.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ---
 
@@ -59,7 +59,7 @@ Script version: **6.0.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | # | Section | Script | Skip flag | What it does |
 |---|---|---|---|---|
 | 1 | preflight | both | — | system: root check, OS/arch/apt detection; user: not-root check, `~/.local/bin`, `~/.config/dev-bootstrap` |
-| 2 | git identity / start folder / agents | user | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the three prompts |
+| 2 | git identity / start folder / agents / ssh key | user | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the four prompts |
 | 3 | cleanup | system | — | remove our old apt artifacts |
 | 4 | system packages | system | `SKIP_SYSTEM` | one apt transaction for `BASE_PKGS` |
 | 5 | node | both | `SKIP_NODE` | newest Node from NodeSource + npm globals, updated every run |
@@ -108,6 +108,7 @@ each script.
 | `PG_MAJOR` | empty | pin a client major; empty = newest PGDG carries |
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Claude Code plugins |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | both set = no prompt |
+| `DEV_SSH_PUBKEY` | asked | public key line for `~/.ssh/authorized_keys`; Enter at the prompt skips it |
 | `DEV_UFW_TRUST` | empty | networks ufw allows on every port and fail2ban ignores |
 | `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads every GitHub-release tool |
 
@@ -150,6 +151,7 @@ are skipped with a warning.
 - `~/.claude/settings.json`: only missing keys are seeded (jq deep-merge,
   existing values win).
 - `~/.ssh/config`: keepalive block appended once if absent.
+- `~/.ssh/authorized_keys`: the `DEV_SSH_PUBKEY` key appended once (a key already there is reported), file `600`; warns when `~` or `~/.ssh` is group/world-writable, since sshd then ignores it.
 
 **Yours entirely, never written:** `~/.config/dev-bootstrap/local.sh` (and
 anything named `local*` in that directory), `~/.config/nvim/lua/local.lua`.

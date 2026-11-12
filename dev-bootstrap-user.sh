@@ -51,6 +51,11 @@
 #   DEV_AI_AGENTS=both bash dev-bootstrap-user.sh    # claude | codex | both | none
 #   SKIP_CLAUDE=1 / SKIP_CODEX=1                     # veto one regardless of the answer
 #
+# Last, it asks for your SSH public key and adds it to ~/.ssh/authorized_keys
+# (Enter skips it):
+#
+#   DEV_SSH_PUBKEY="$(cat ~/.ssh/id_ed25519.pub)" bash dev-bootstrap-user.sh
+#
 # Deliberately NOT using `set -e`: one failing step must never leave the
 # setup half-done. Failures are collected and reported at the end.
 #
@@ -68,6 +73,7 @@ DEV_AI_AGENTS="${DEV_AI_AGENTS:-}"      # empty = ask; claude | codex | both | n
 CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
+DEV_SSH_PUBKEY="${DEV_SSH_PUBKEY:-}"   # empty = ask; a public key for ~/.ssh/authorized_keys
 SKIP_NODE="${SKIP_NODE:-0}"             # the npm globals
 SKIP_PYTHON="${SKIP_PYTHON:-0}"
 SKIP_DOTNET="${SKIP_DOTNET:-0}"         # the .NET global tools
@@ -376,6 +382,37 @@ INSTALL_CLAUDE=0; INSTALL_CODEX=0
 # Remembered so the next run can offer it as the default, and so this stays
 # put when a later run has no terminal to ask from.
 printf '%s\n' "$DEV_AI_AGENTS" > "$AI_AGENTS_STATE" 2>/dev/null || true
+
+# ----------------------------------------------------------- ssh public key -
+# The key you log in to this machine with, added to ~/.ssh/authorized_keys.
+# DEV_SSH_PUBKEY answers up front; Enter at the prompt skips it. Asked every
+# run, because a key already in the file is simply reported as such.
+#
+# ssh_key_ok <line> — one public key line, nothing else: no options prefix, no
+# second line, and ssh-keygen must be able to read it.
+ssh_key_ok() {
+  [[ "$1" != *$'\n'* ]] || return 1
+  [[ "$1" =~ ^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\ [A-Za-z0-9+/]+=*(\ .*)?$ ]] || return 1
+  ssh-keygen -l -f - <<<"$1" >/dev/null 2>&1
+}
+if [[ -z "$DEV_SSH_PUBKEY" ]] && (exec </dev/tty) 2>/dev/null; then
+  log "SSH public key"
+  sub "paste the ONE line from your id_ed25519.pub (or id_rsa.pub) to log in with"
+  sub "it — Enter to skip"
+  while :; do
+    ssh_answer=""                        # ask_tty fills this in with printf -v
+    ask_tty ssh_answer "Key" ""
+    [[ -z "$ssh_answer" ]] && break
+    if ssh_key_ok "$ssh_answer"; then DEV_SSH_PUBKEY="$ssh_answer"; break; fi
+    if [[ "$ssh_answer" == *PRIVATE* ]]; then
+      warn "that is a PRIVATE key — it never leaves your own computer. Paste the .pub file."
+    else
+      warn "that is not a public key line"
+    fi
+    # A multi-line paste would otherwise feed its remaining lines to the next prompts.
+    while IFS= read -r -t 0.3 _ </dev/tty; do :; done
+  done
+fi
 
 # ==================================================================== node ==
 # Node itself comes from the system half (NodeSource); the globals live in
@@ -2321,12 +2358,35 @@ fi
 
 
 # ===================================================================== ssh ===
-  if ! grep -q "ServerAliveInterval" "$HOME/.ssh/config" 2>/dev/null; then
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-    printf 'Host *\n    ServerAliveInterval 60\n    ServerAliveCountMax 5\n    AddKeysToAgent yes\n' \
-      >> "$HOME/.ssh/config"
-    chmod 600 "$HOME/.ssh/config"
+if [[ -n "$DEV_SSH_PUBKEY" ]]; then
+  log "SSH public key"
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  ak="$HOME/.ssh/authorized_keys"
+  if ! ssh_key_ok "$DEV_SSH_PUBKEY"; then
+    warn "DEV_SSH_PUBKEY is not a single public key line — not added"; note_fail "ssh key"
+  elif [[ -f "$ak" ]] && awk '{for (i = 1; i <= NF; i++) print $i}' "$ak" \
+         | grep -qxF "$(awk '{print $2}' <<<"$DEV_SSH_PUBKEY")"; then
+    sub "already in ~/.ssh/authorized_keys"
+  else
+    # A file without a final newline would glue our key onto its last one.
+    [[ -s "$ak" && -n "$(tail -c1 "$ak")" ]] && printf '\n' >> "$ak"
+    printf '%s\n' "$DEV_SSH_PUBKEY" >> "$ak"
+    sub "added to ~/.ssh/authorized_keys: $(ssh-keygen -l -f - <<<"$DEV_SSH_PUBKEY" 2>/dev/null)"
   fi
+  [[ -f "$ak" ]] && chmod 600 "$ak"
+  # sshd (StrictModes) ignores authorized_keys when home or ~/.ssh is writable by others.
+  if [[ -n "$(find "$HOME" "$HOME/.ssh" -maxdepth 0 -perm /022 2>/dev/null)" ]]; then
+    warn "your home or ~/.ssh is group/world-writable — sshd will ignore the key: chmod go-w ~ ~/.ssh"
+    note_fail "ssh key (permissions)"
+  fi
+fi
+
+if ! grep -q "ServerAliveInterval" "$HOME/.ssh/config" 2>/dev/null; then
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  printf 'Host *\n    ServerAliveInterval 60\n    ServerAliveCountMax 5\n    AddKeysToAgent yes\n' \
+    >> "$HOME/.ssh/config"
+  chmod 600 "$HOME/.ssh/config"
+fi
 
 # ====================================================== shared dev folder ===
 if [[ -d "$DEV_ROOT" ]] && getent group "$DEV_GROUP" >/dev/null 2>&1; then

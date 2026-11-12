@@ -73,6 +73,7 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap-user.sh
 | `DEV_AI_AGENTS` | user | asked for | `claude`, `codex`, `both` or `none`; setting it skips the prompt |
 | `DEV_TMUX_RESET` | user | `1` | Clear stale options/bindings out of a running tmux server before reloading |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | user | empty | Git identity; setting **both** skips the prompt |
+| `DEV_SSH_PUBKEY` | user | asked for | One public key line added to `~/.ssh/authorized_keys`; setting it skips the prompt, Enter at the prompt skips the step |
 | `CLAUDE_PLUGINS` | user | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
 
 Skip flags — set any of them to `1`:
@@ -355,4 +356,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **6.0.0** (see `VERSION`).
+Current version: **6.1.0** (see `VERSION`).
