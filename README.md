@@ -1,78 +1,96 @@
 # vellox-bootstrap
 
-`dev-bootstrap.sh` — one-file bootstrap for an Ubuntu developer machine.
+Two scripts bootstrap an Ubuntu developer machine:
 
-Supports **Ubuntu 24.04 LTS (noble)** and **26.04 LTS (resolute)** from the same
-file. Everything release-specific is detected at runtime, so there is nothing to
+| Script | Run as | Does |
+| --- | --- | --- |
+| `dev-bootstrap-system.sh` | **root**, once per machine | apt packages, Node, .NET SDK, Postgres/SQL Server clients, Docker, extra tools in `/usr/local/bin`, kernel and file limits, hardening |
+| `dev-bootstrap-user.sh` | **each developer, as themselves** — no sudo | shell, tmux, editor, git and Claude Code config; npm globals, uv/pipx tools, .NET global tools, mise, Claude Code / Codex |
+
+Run the system one first: the user one configures what it installed, and
+stops early if `git`, `jq`, `tmux` or `curl` is missing.
+
+Supports **Ubuntu 24.04 LTS (noble)** and **26.04 LTS (resolute)**.
+Everything release-specific is detected at runtime, so there is nothing to
 edit per machine.
 
 For what every installed tool does, where its config lives and how the
 pieces fit together, see **[MANUAL.md](MANUAL.md)** — written so a person or
 an AI session can answer "how does X work on this machine?" without reading
-the script.
+the scripts.
 
 ## Usage
 
-Run as your normal user — **not** root, **not** with `sudo`. The script asks for
-`sudo` where it needs it and keeps the credential alive for the duration.
-
 ```bash
-bash dev-bootstrap.sh                  # everything
-bash dev-bootstrap.sh --clean-only     # only remove the apt artifacts we created
-bash dev-bootstrap.sh --help
+sudo bash dev-bootstrap-system.sh                 # the machine (asks nothing)
+sudo bash dev-bootstrap-system.sh --clean-only    # only remove the apt artifacts we created
+bash dev-bootstrap-user.sh                        # you (asks identity, start folder, agent)
+bash dev-bootstrap-system.sh --help               # either script
 ```
 
 ### On a brand-new server
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap-system.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap-user.sh | bash
 ```
 
-Keeping the file around is nicer — re-runs, `--help` and `--clean-only` all
-work from it:
+Keeping the files around is nicer — re-runs, `--help` and `--clean-only` all
+work from them:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/dev-bootstrap.sh \
-  -o dev-bootstrap.sh && bash dev-bootstrap.sh
+for f in dev-bootstrap-system.sh dev-bootstrap-user.sh; do
+  curl -fsSL "https://raw.githubusercontent.com/vellox-ab/vellox-bootstrap/main/$f" -o "$f"
+done
+sudo bash dev-bootstrap-system.sh && bash dev-bootstrap-user.sh
 ```
+
+A new developer on an existing machine only needs the user script.
 
 Sections can be skipped, and a few settings overridden, with environment
-variables:
+variables (with `sudo`, put them after it: `sudo SKIP_MSSQL=1 bash ...`):
 
 ```bash
-SKIP_MSSQL=1 bash dev-bootstrap.sh
-DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
-DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
-NODE_MAJOR=current bash dev-bootstrap.sh     # newest Node major, not newest LTS
+sudo SKIP_MSSQL=1 bash dev-bootstrap-system.sh
+sudo DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap-system.sh   # re-fetch the GitHub-release tools
+sudo NODE_MAJOR=current bash dev-bootstrap-system.sh     # newest Node major, not newest LTS
+DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap-user.sh
 ```
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DEV_ROOT` | `/srv/dev` | Shared development folder |
-| `DEV_GROUP` | `devgroup` | Group that owns `DEV_ROOT` |
-| `NODE_MAJOR` | `lts` | `lts` (newest LTS), `current` (newest major) or a major number |
-| `DOTNET_MAJOR` | empty | Pin an SDK major; empty takes the newest the distro has |
-| `DOTNET_TOOLS` | `csharp-ls dotnet-ef` | .NET global tools to install |
-| `PG_MAJOR` | empty | Pin a PGDG client major; empty takes the newest |
-| `DEV_EDITOR` | `nano` | `nano`, `micro` or `nvim` |
-| `DEV_TMUX_AUTOSTART` | `1` | Attach tmux on login |
-| `DEV_START_DIR` | asked for | Folder every login starts in; setting it skips the prompt |
-| `DEV_AI_AGENTS` | asked for | `claude`, `codex`, `both` or `none`; setting it skips the prompt |
-| `DEV_TMUX_RESET` | `1` | Clear stale options/bindings out of a running tmux server before reloading |
-| `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | Git identity; setting **both** skips the prompt |
-| `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
-| `DEV_UFW_TRUST` | empty | Networks ufw allows on every port and fail2ban never bans |
-| `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads the tools that come from GitHub releases |
+| Variable | Script | Default | Meaning |
+| --- | --- | --- | --- |
+| `NODE_MAJOR` | system | `lts` | `lts` (newest LTS), `current` (newest major) or a major number |
+| `DOTNET_MAJOR` | system | empty | Pin an SDK major; empty takes the newest the distro has |
+| `PG_MAJOR` | system | empty | Pin a PGDG client major; empty takes the newest |
+| `DEV_UFW_TRUST` | system | empty | Networks ufw allows on every port and fail2ban never bans |
+| `DEV_EXTRAS_UPGRADE` | both | `0` | `1` re-downloads the GitHub-release tools (system) and mise / bash-preexec (user) |
+| `DEV_ROOT` | user | `/srv/dev` | Shared development folder |
+| `DEV_GROUP` | user | `devgroup` | Group that owns `DEV_ROOT` (you are warned if not in it) |
+| `DOTNET_TOOLS` | user | `csharp-ls dotnet-ef` | .NET global tools to install |
+| `DEV_EDITOR` | user | `nano` | `nano`, `micro` or `nvim` |
+| `DEV_TMUX_AUTOSTART` | user | `1` | Attach tmux on login |
+| `DEV_START_DIR` | user | asked for | Folder every login starts in; setting it skips the prompt |
+| `DEV_AI_AGENTS` | user | asked for | `claude`, `codex`, `both` or `none`; setting it skips the prompt |
+| `DEV_TMUX_RESET` | user | `1` | Clear stale options/bindings out of a running tmux server before reloading |
+| `GIT_USER_NAME` / `GIT_USER_EMAIL` | user | empty | Git identity; setting **both** skips the prompt |
+| `CLAUDE_PLUGINS` | user | `pyright-lsp typescript-lsp csharp-lsp` | Plugins to install from `claude-plugins-official` |
 
-Skip flags: `SKIP_SYSTEM`, `SKIP_NODE`, `SKIP_PYTHON`, `SKIP_MSSQL`,
-`SKIP_DOTNET`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`, `SKIP_HARDENING`, `SKIP_AUTOREMOVE`,
-`SKIP_CLAUDE`, `SKIP_CODEX`, `SKIP_TMUX_CONF`, `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`,
-`SKIP_SYSCTL`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`, `SKIP_CLAUDE_CONF`,
-`SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR` — set any of them to `1`.
+Skip flags — set any of them to `1`:
+
+- system: `SKIP_SYSTEM`, `SKIP_NODE` (NodeSource), `SKIP_DOTNET` (the SDK),
+  `SKIP_MSSQL`, `SKIP_POSTGRES`, `SKIP_EXTRAS`, `SKIP_DOCKER`,
+  `SKIP_HARDENING`, `SKIP_SYSCTL`, `SKIP_AUTOREMOVE`
+- user: `SKIP_NODE` (npm globals), `SKIP_PYTHON`, `SKIP_DOTNET` (global
+  tools), `SKIP_EXTRAS` (mise, bash-preexec, tldr cache, atuin import),
+  `SKIP_CLAUDE`, `SKIP_CODEX`, `SKIP_CLAUDE_CONF`, `SKIP_TMUX_CONF`,
+  `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
+  `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR`
+
+The three questions below are all asked by the user script.
 
 ### Git identity
 
-Near the start of the run the script asks for the name and email to use as the
+Near the start of the run the user script asks for the name and email to use as the
 global git identity, and writes them to `user.name` / `user.email` in
 `~/.gitconfig`:
 
@@ -88,8 +106,8 @@ email is checked for a basic `local@domain.tld` shape. Answering up front, or no
 at all:
 
 ```bash
-GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap.sh
-SKIP_GIT_IDENTITY=1 bash dev-bootstrap.sh    # never ask, leave the identity alone
+GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap-user.sh
+SKIP_GIT_IDENTITY=1 bash dev-bootstrap-user.sh    # never ask, leave the identity alone
 ```
 
 The prompt reads from `/dev/tty`, so it also works when the script is piped into
@@ -118,8 +136,8 @@ autostart creates the `dev` session, and a `cd` for a login shell that starts in
 (`ssh host -t 'cd /x && bash -l'`, a new tmux pane, VS Code) is never moved.
 
 ```bash
-DEV_START_DIR=/srv/dev/app bash dev-bootstrap.sh   # answer up front
-SKIP_START_DIR=1 bash dev-bootstrap.sh             # never ask
+DEV_START_DIR=/srv/dev/app bash dev-bootstrap-user.sh   # answer up front
+SKIP_START_DIR=1 bash dev-bootstrap-user.sh             # never ask
 ```
 
 To change it later, re-run with `DEV_START_DIR=...`, or set it in
@@ -143,7 +161,7 @@ machine is never removed, and the config sections still apply to whatever is
 present.
 
 ```bash
-DEV_AI_AGENTS=both bash dev-bootstrap.sh    # answer up front (claude|codex|both|none)
+DEV_AI_AGENTS=both bash dev-bootstrap-user.sh    # answer up front (claude|codex|both|none)
 SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
 ```
 
@@ -158,7 +176,7 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
 - **Extra tools** — the ones apt does not have on every release, installed from
   apt where it does (26.04 carries most of them) and from the project's latest
   GitHub release otherwise — a `.deb` through apt when one is published, a
-  binary in `~/.local/bin` if not:
+  binary in `/usr/local/bin` (for every user) if not:
   - `lazygit` (`lg`) with a Catppuccin config and delta as its pager
   - `starship` as the prompt, same palette and layout as the built-in one, no
     Nerd Font glyphs (`DEV_PROMPT=bash` in `local.sh` brings the old one back)
@@ -174,7 +192,8 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
     `harlequin` (TUI SQL IDE, Postgres + ODBC adapters), `ast-grep`
 - **Docker** — `docker-ce` with buildx and the compose plugin from Docker's own
   repo, or Ubuntu's `docker.io` + `docker-compose-v2` while that repo has no
-  suite for the release yet; you are added to the `docker` group. An
+  suite for the release yet; whoever ran `sudo` is added to the `docker` group
+  (others: `sudo usermod -aG docker <user>`). An
   installed docker-ce keeps its source so `apt upgrade` updates it — the
   script never upgrades it itself, as that restarts every container. Plus
   `lazydocker` (`lzd`) and `dive`.
@@ -258,7 +277,8 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
 - **PostgreSQL client** — the newest `psql` / `pg_dump` from PGDG, `libpq-dev`,
   plus a `psql` pager setup.
 - **System tuning** — raised inotify limits (file watchers and agentic tooling),
-  open-file limit lifted from the 1024 default, SSH keepalives.
+  open-file limit lifted from the 1024 default (system); SSH keepalives in
+  `~/.ssh/config` (user).
 
 At the end it verifies the login-shell wiring, prints the version of everything
 it installed, and lists anything that did not complete.
@@ -316,13 +336,16 @@ Everything moved aside is listed again at the end of the run.
   installed too, so apt keeps updating them. Sources it did not create are
   listed but never touched.
 - **Leaves nothing unused behind.** npm globals it no longer installs are
-  uninstalled, stale copies in `~/.local/bin` go once apt (or mssql-tools18)
-  provides the real thing at the same version or newer, and the run ends by removing dangling links,
+  uninstalled, stale copies in `~/.local/bin` go once the system install (apt,
+  `/usr/local/bin` or mssql-tools18) provides the same version or newer, and the run ends by removing dangling links,
   running `apt autoremove --purge`, and purging what removed kernels and Node
   packages left behind. Database servers, Docker and the bootloader are never
   removed — purging them deletes data or boot config — and other leftovers
   of packages removed by hand are listed, not purged. `SKIP_AUTOREMOVE=1`
   only lists.
+- **System and user are separate.** Everything outside your home directory
+  happens in the root script, everything inside it in the user script, so a
+  developer without sudo rights can set themselves up on a shared machine.
 - **No `set -e`.** A single failing repo must never leave the machine
   half-configured. Failures are collected and reported at the end, and
   re-running retries only those steps.
@@ -332,4 +355,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **5.10.0** (see `VERSION`).
+Current version: **6.0.0** (see `VERSION`).

@@ -1,11 +1,11 @@
 # dev-bootstrap — reference manual
 
-Everything `dev-bootstrap.sh` installs and configures, what each piece is for,
+Everything `dev-bootstrap-system.sh` and `dev-bootstrap-user.sh` install and configure, what each piece is for,
 where it lives on disk, how the pieces fit together, and how to turn each one
 off. Written so that a person — or an AI session with this repository open —
-can answer "how does X work on this machine?" without reading the script.
+can answer "how does X work on this machine?" without reading the scripts.
 
-Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
+Script version: **6.0.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ---
 
@@ -13,8 +13,12 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ### 1.1 Run model
 
-- Run as a normal user, never root. `sudo` is requested once up front and kept
-  alive by a background `sudo -n true` loop for the whole run.
+- Two scripts. `dev-bootstrap-system.sh` runs **as root** (`sudo bash ...`),
+  once per machine, and asks nothing: everything outside a home directory —
+  apt, `/etc`, `/usr/local/bin`, Docker, the firewall. `dev-bootstrap-user.sh`
+  runs **as each developer**, never root, and needs no sudo at all:
+  everything inside `$HOME`. Run the system one first; the user one stops
+  early if `git`, `jq`, `tmux` or `curl` is missing.
 - **No `set -e`.** A failing step is recorded in `FAILED_STEPS` and the run
   continues. The summary at the end lists what did not complete; a re-run
   retries only those steps, because every section checks "already present?"
@@ -28,10 +32,12 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
   listed but never touched.
 - **Leaves nothing unused behind.** npm globals it no longer installs
   (`NPM_RETIRED`) are uninstalled; superseded PostgreSQL clients are marked
-  automatic; a GitHub-release copy in `~/.local/bin` goes once apt packages the
+  automatic; a GitHub-release copy in `/usr/local/bin` goes once apt packages the
   tool at the same version or newer (a newer copy stays: atuin cannot go back
-  a version on a history.db it already migrated), and so does the go-sqlcmd fallback once `mssql-tools18` is in. The
-  leftovers section then removes dangling links in `~/.local/bin`, runs
+  a version on a history.db it already migrated), and the user script removes `~/.local/bin` copies (from the old single-script
+  bootstrap, or the go-sqlcmd fallback) once the system provides the same
+  version or newer. The user script removes dangling links in `~/.local/bin`;
+  the system one runs
   `apt autoremove --purge`, and purges what removed kernels and Node packages
   left behind (dpkg state `rc`).
   - **Never removed:** database servers (`postgresql-NN` deletes its clusters
@@ -42,7 +48,7 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
   - Other `rc` leftovers were removed by hand and may hold data, so they are
     listed, not purged. `SKIP_AUTOREMOVE=1` lists the apt part and changes
     nothing. `--clean-only` does just the removal.
-- Three questions are asked near the start, reading from `/dev/tty` so they
+- Three questions are asked near the start of the user script, reading from `/dev/tty` so they
   also work when piped from curl: the **git identity**, the **start
   folder** and the **AI coding agents** (Claude Code, OpenAI Codex, both or
   none). All can be pre-answered with environment variables and all are
@@ -50,34 +56,40 @@ Script version: **5.8.1**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 
 ### 1.2 Sections, in execution order
 
-| # | Section | Skip flag | What it does |
-|---|---|---|---|
-| 1 | preflight | — | OS/arch/apt detection, sudo, `~/.local/bin`, `~/.config/dev-bootstrap` |
-| 2 | git identity / start folder / agents | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the three prompts |
-| 3 | cleanup | — | remove our old apt artifacts |
-| 4 | system packages | `SKIP_SYSTEM` | one apt transaction for `BASE_PKGS` |
-| 5 | node | `SKIP_NODE` | newest Node from NodeSource + npm globals, updated every run |
-| 6 | python | `SKIP_PYTHON` | uv, pipx tools |
-| 7 | .NET | `SKIP_DOTNET` | SDK + global tools |
-| 8 | claude code | `SKIP_CLAUDE` | native installer (if chosen at the agents prompt) |
-| 9 | openai codex | `SKIP_CODEX` | npm global (if chosen at the agents prompt) |
-| 10 | extra tools | `SKIP_EXTRAS` | GitHub-release tools, mise, bash-preexec |
-| 11 | docker | `SKIP_DOCKER` | docker-ce or docker.io, group, lazydocker, dive |
-| 12 | claude code conf | `SKIP_CLAUDE_CONF` | status line, settings seed, LSP plugins |
-| 13 | old shell config | `SKIP_LEGACY_CLEAN` | neutralise earlier setups |
-| 14 | tmux.conf | `SKIP_TMUX_CONF` | write + hot-reload |
-| 15 | shell config | `SKIP_SHELL_CONF` | write `rc.sh`, hook `.bashrc`, login bridge |
-| 16 | completions | `SKIP_SHELL_CONF` | pre-generate completion files |
-| 17 | inputrc | `SKIP_INPUTRC` | readline |
-| 18 | editor config | `SKIP_EDITOR_CONF` | bat theme, nano, micro, nvim, starship, atuin, lazygit, tealdeer, fastfetch, psql |
-| 19 | rc.sh tail | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
-| 20 | git config | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
-| 21 | MS SQL tooling | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
-| 22 | postgres | `SKIP_POSTGRES` | newest psql from PGDG |
-| 23 | system tuning | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
-| 24 | hardening | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
-| 25 | leftovers | `SKIP_AUTOREMOVE` (lists only) | dangling links, `apt autoremove --purge`, purge kernel/Node residue |
-| 26 | verify | — | apt health, login-shell probe, version table |
+| # | Section | Script | Skip flag | What it does |
+|---|---|---|---|---|
+| 1 | preflight | both | — | system: root check, OS/arch/apt detection; user: not-root check, `~/.local/bin`, `~/.config/dev-bootstrap` |
+| 2 | git identity / start folder / agents | user | `SKIP_GIT_IDENTITY`, `SKIP_START_DIR` | the three prompts |
+| 3 | cleanup | system | — | remove our old apt artifacts |
+| 4 | system packages | system | `SKIP_SYSTEM` | one apt transaction for `BASE_PKGS` |
+| 5 | node | both | `SKIP_NODE` | newest Node from NodeSource + npm globals, updated every run |
+| 6 | python | user | `SKIP_PYTHON` | uv, pipx tools |
+| 7 | .NET | both | `SKIP_DOTNET` | SDK + global tools |
+| 8 | claude code | user | `SKIP_CLAUDE` | native installer (if chosen at the agents prompt) |
+| 9 | openai codex | user | `SKIP_CODEX` | npm global (if chosen at the agents prompt) |
+| 10 | extra tools | both | `SKIP_EXTRAS` | GitHub-release tools, mise, bash-preexec |
+| 11 | docker | system | `SKIP_DOCKER` | docker-ce or docker.io, group, lazydocker, dive |
+| 12 | claude code conf | user | `SKIP_CLAUDE_CONF` | status line, settings seed, LSP plugins |
+| 13 | old shell config | user | `SKIP_LEGACY_CLEAN` | neutralise earlier setups |
+| 14 | tmux.conf | user | `SKIP_TMUX_CONF` | write + hot-reload |
+| 15 | shell config | user | `SKIP_SHELL_CONF` | write `rc.sh`, hook `.bashrc`, login bridge |
+| 16 | completions | user | `SKIP_SHELL_CONF` | pre-generate completion files |
+| 17 | inputrc | user | `SKIP_INPUTRC` | readline |
+| 18 | editor config | user | `SKIP_EDITOR_CONF` | bat theme, nano, micro, nvim, starship, atuin, lazygit, tealdeer, fastfetch, psql |
+| 19 | rc.sh tail | user | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
+| 20 | git config | user | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
+| 21 | MS SQL tooling | system | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
+| 22 | postgres | system | `SKIP_POSTGRES` | newest psql from PGDG |
+| 23 | system tuning | both | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
+| 24 | hardening | system | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
+| 25 | leftovers | both | `SKIP_AUTOREMOVE` (lists only) | dangling links, `apt autoremove --purge`, purge kernel/Node residue |
+| 26 | verify | both | — | apt health, login-shell probe, version table |
+
+"both" means the system script does the machine part (Node itself, the .NET SDK,
+the release binaries, inotify/nofile, apt leftovers) and the user script the
+per-user part (npm globals, .NET global tools, mise / bash-preexec / atuin
+import, `~/.ssh/config` keepalive, `~/.local/bin` leftovers). Same order within
+each script.
 
 ### 1.3 Settings (environment variables)
 
@@ -349,7 +361,7 @@ runs `gh_bin <repo> <asset-regex> <binary…>` for each:
    asset matching the regex is downloaded.
 3. A `.deb` goes through `apt-get install ./file.deb` (tracked by dpkg, man
    page included). Archives are unpacked and the named binaries copied to
-   `~/.local/bin`.
+   `/usr/local/bin`, for every user.
 
 Which route each tool takes on each release:
 
@@ -372,7 +384,7 @@ Which route each tool takes on each release:
 | mise | own installer (`mise.run`) | same | `~/.local/bin/mise` |
 
 There is no automatic upgrade for release-installed binaries; apt ones
-upgrade with the system. `DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh`
+upgrade with the system. `sudo DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap-system.sh`
 refreshes all of them.
 
 ### 4.2 Git tooling
@@ -589,7 +601,7 @@ SSH allowed on **every port sshd actually listens on** (`sshd -T`, default
 `DEV_UFW_TRUST`** — empty by default, so the script is production-safe and
 every other port is opened on purpose, e.g. for the reverse proxy:
 `sudo ufw allow from 10.4.20.25 to any port 4010 proto tcp`. To trust a
-LAN/VPN on a dev box: `DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap.sh`.
+LAN/VPN on a dev box: `sudo DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap-system.sh`.
 Ranges an earlier run trusted (older versions trusted all of RFC 1918) are
 deleted on the next run if `DEV_UFW_TRUST` no longer lists them; rules you
 added yourself are never touched.
@@ -667,9 +679,9 @@ Base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, mauve `#cba6f7`, green
 | Locked out of SSH by fail2ban | from a trusted network it cannot happen (`ignoreip`); otherwise `fail2ban-client set sshd unbanip <ip>` from the console |
 | `tldr` says cache is missing | `tldr --update` (needs network) |
 | `trip` asks for root | `sudo setcap cap_net_raw+ep $(command -v trip)` |
-| GitHub-release tool missing after a run | anonymous API limit (60/h) hit — `gh auth login` or wait, then re-run; the summary lists it under "Did not complete" |
-| apt errors about duplicate `Signed-By` | another installer added a second source for the same repo; `bash dev-bootstrap.sh --clean-only`, remove the other, re-run |
+| GitHub-release tool missing after a run | anonymous API limit (60/h) hit — `sudo gh auth login` (the system script runs as root) or wait, then re-run; the summary lists it under "Did not complete" |
+| apt errors about duplicate `Signed-By` | another installer added a second source for the same repo; `sudo bash dev-bootstrap-system.sh --clean-only`, remove the other, re-run |
 | `sg` runs ast-grep instead of the setgid tool | expected in interactive shells (`~/.local/bin` first on PATH); use `/usr/bin/sg` or `ast-grep` |
 
 Everything the run could not complete is printed at the end under
-**"Did not complete"**; `bash dev-bootstrap.sh` again retries only those.
+**"Did not complete"**; running that script again retries only those.

@@ -1,43 +1,21 @@
 #!/usr/bin/env bash
 # HELP>
-# dev-bootstrap.sh (v5) — Ubuntu developer machine bootstrap
+# dev-bootstrap-user.sh (v6) — the per-user half of the Ubuntu dev bootstrap
 #
-# Supports Ubuntu 24.04 LTS (noble) and 26.04 LTS (resolute) from one file.
-# Everything release-specific is detected at runtime; there is nothing to edit
-# per machine.
+# Run as YOURSELF — not root, not with sudo. It needs no sudo at all: it only
+# writes to your home directory. Run dev-bootstrap-system.sh (as root) on the
+# machine first; this one configures what that one installed.
 #
-# Idempotent AND self-cleaning: every re-run first removes the apt sources and
-# keyrings that earlier versions of this script created, then re-derives them
-# for the release it is actually running on. It never touches sources it did
-# not create.
+#   bash dev-bootstrap-user.sh             # everything
+#   bash dev-bootstrap-user.sh --help
 #
-# Run as your normal user (NOT root, NOT with sudo).
+#   DEV_EDITOR=micro bash dev-bootstrap-user.sh
+#   DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap-user.sh   # re-fetch mise and bash-preexec
 #
-#   bash dev-bootstrap.sh                  # everything
-#   bash dev-bootstrap.sh --clean-only     # only remove our apt artifacts
-#   bash dev-bootstrap.sh --help
-#
-#   SKIP_MSSQL=1 bash dev-bootstrap.sh     # skip a section
-#   DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap.sh
-#   DEV_EXTRAS_UPGRADE=1 bash dev-bootstrap.sh   # re-fetch the GitHub-release tools
-#   NODE_MAJOR=current bash dev-bootstrap.sh     # newest Node major, not newest LTS
-#
-# Every run brings Node (NodeSource), its global npm tools and the PostgreSQL
-# client up to the newest release, and keeps their apt sources configured.
-# It ends by removing what nothing uses any more — unused packages, config
-# left by removed kernels and Node packages, stale copies in ~/.local/bin.
-# Database servers, Docker and the bootloader are never removed.
-#
-#   SKIP_AUTOREMOVE=1 bash dev-bootstrap.sh    # list leftover packages only
-#
-# Beyond the base packages it installs a set of extra tools (lazygit, atuin,
-# starship, mise, watchexec, difftastic, yazi, lnav, mosh, ttyd, ...), Docker
-# from Docker's own repo, and a light hardening pass (unattended-upgrades,
-# fail2ban, ufw). The firewall opens SSH (and mosh) only; set DEV_UFW_TRUST to
-# networks that should reach every port (none by default — production-safe).
-#
-#   SKIP_EXTRAS=1 SKIP_DOCKER=1 SKIP_HARDENING=1 bash dev-bootstrap.sh
-#   DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap.sh
+# What it does: your shell, tmux, editor, git, psql and Claude Code config;
+# per-user tools (npm globals in ~/.local, uv and pipx tools, .NET global
+# tools, mise, Claude Code / OpenAI Codex). It ends by removing dangling links
+# and stale copies in ~/.local/bin that the system install now provides.
 #
 # Config files (~/.tmux.conf, ~/.inputrc, ~/.nanorc, ~/.psqlrc, the micro and
 # Claude Code files) are written WHOLE — they belong to this script. What was
@@ -51,30 +29,30 @@
 #   * options and key bindings still live in a RUNNING tmux server: sourcing a
 #     config never unsets anything, so the server is put back to stock first
 #
-#   SKIP_LEGACY_CLEAN=1 bash dev-bootstrap.sh   # leave all of the above alone
-#   DEV_TMUX_RESET=0    bash dev-bootstrap.sh   # never touch a running server
+#   SKIP_LEGACY_CLEAN=1 bash dev-bootstrap-user.sh   # leave all of the above alone
+#   DEV_TMUX_RESET=0    bash dev-bootstrap-user.sh   # never touch a running server
 #
 # The global git identity (user.name / user.email) is asked for interactively
 # near the start of the run. To answer it up front instead:
 #
-#   GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap.sh
-#   SKIP_GIT_IDENTITY=1 bash dev-bootstrap.sh    # never ask, leave git alone
+#   GIT_USER_NAME='Your Name' GIT_USER_EMAIL=you@example.com bash dev-bootstrap-user.sh
+#   SKIP_GIT_IDENTITY=1 bash dev-bootstrap-user.sh    # never ask, leave git alone
 #
 # It also asks which folder a login should start in: the folder the tmux
 # session opens in, and the one a login shell cds to when tmux is off. The
 # answer is remembered, so every re-run after the first is just Enter.
 #
-#   DEV_START_DIR=/srv/dev/app bash dev-bootstrap.sh   # answer up front
-#   SKIP_START_DIR=1 bash dev-bootstrap.sh             # never ask
+#   DEV_START_DIR=/srv/dev/app bash dev-bootstrap-user.sh   # answer up front
+#   SKIP_START_DIR=1 bash dev-bootstrap-user.sh             # never ask
 #
 # And it asks which AI coding agent to install: Claude Code, OpenAI Codex,
 # both, or none. That answer is remembered too.
 #
-#   DEV_AI_AGENTS=both bash dev-bootstrap.sh    # claude | codex | both | none
-#   SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
+#   DEV_AI_AGENTS=both bash dev-bootstrap-user.sh    # claude | codex | both | none
+#   SKIP_CLAUDE=1 / SKIP_CODEX=1                     # veto one regardless of the answer
 #
-# Deliberately NOT using `set -e`: a single failing repo must never leave the
-# machine half-configured. Failures are collected and reported at the end.
+# Deliberately NOT using `set -e`: one failing step must never leave the
+# setup half-done. Failures are collected and reported at the end.
 #
 # <HELP
 set -uo pipefail
@@ -82,10 +60,7 @@ set -uo pipefail
 # ---------------------------------------------------------------- settings --
 DEV_ROOT="${DEV_ROOT:-/srv/dev}"
 DEV_GROUP="${DEV_GROUP:-devgroup}"
-NODE_MAJOR="${NODE_MAJOR:-lts}"         # lts | current | a major number
-DOTNET_MAJOR="${DOTNET_MAJOR:-}"        # empty = newest SDK the distro offers
 DOTNET_TOOLS="${DOTNET_TOOLS:-csharp-ls dotnet-ef}"
-PG_MAJOR="${PG_MAJOR:-}"                # empty = newest client PGDG carries
 DEV_EDITOR="${DEV_EDITOR:-nano}"        # nano | micro | nvim
 DEV_TMUX_AUTOSTART="${DEV_TMUX_AUTOSTART:-1}"
 DEV_START_DIR="${DEV_START_DIR:-}"      # empty = ask; where a login lands
@@ -93,54 +68,38 @@ DEV_AI_AGENTS="${DEV_AI_AGENTS:-}"      # empty = ask; claude | codex | both | n
 CLAUDE_PLUGINS="${CLAUDE_PLUGINS:-pyright-lsp typescript-lsp csharp-lsp}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
-SKIP_SYSTEM="${SKIP_SYSTEM:-0}"
-SKIP_NODE="${SKIP_NODE:-0}"
+SKIP_NODE="${SKIP_NODE:-0}"             # the npm globals
 SKIP_PYTHON="${SKIP_PYTHON:-0}"
-SKIP_DOTNET="${SKIP_DOTNET:-0}"
-SKIP_MSSQL="${SKIP_MSSQL:-0}"
-SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
-SKIP_EXTRAS="${SKIP_EXTRAS:-0}"         # lazygit, atuin, starship, mise, ...
-SKIP_DOCKER="${SKIP_DOCKER:-0}"
-SKIP_HARDENING="${SKIP_HARDENING:-0}"   # unattended-upgrades, fail2ban, ufw
-SKIP_AUTOREMOVE="${SKIP_AUTOREMOVE:-0}" # 1 = list leftover packages, remove none
-DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
-# Networks the firewall and fail2ban trust outright (every port open to them).
-# Empty by default so the script is safe on production; SSH is allowed from
-# everywhere regardless, so an empty list cannot lock you out.
-DEV_UFW_TRUST="${DEV_UFW_TRUST:-}"
+SKIP_DOTNET="${SKIP_DOTNET:-0}"         # the .NET global tools
+SKIP_EXTRAS="${SKIP_EXTRAS:-0}"         # mise, bash-preexec, tldr cache, atuin import
+DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download mise and bash-preexec
 SKIP_CLAUDE="${SKIP_CLAUDE:-0}"
 SKIP_CODEX="${SKIP_CODEX:-0}"
 SKIP_CLAUDE_CONF="${SKIP_CLAUDE_CONF:-0}"
 SKIP_TMUX_CONF="${SKIP_TMUX_CONF:-0}"
 SKIP_SHELL_CONF="${SKIP_SHELL_CONF:-0}"
 SKIP_EDITOR_CONF="${SKIP_EDITOR_CONF:-0}"
-SKIP_SYSCTL="${SKIP_SYSCTL:-0}"
 SKIP_GIT_CONF="${SKIP_GIT_CONF:-0}"
 SKIP_GIT_IDENTITY="${SKIP_GIT_IDENTITY:-0}"
 SKIP_INPUTRC="${SKIP_INPUTRC:-0}"
 SKIP_LEGACY_CLEAN="${SKIP_LEGACY_CLEAN:-0}"   # 1 = leave old config in place
 SKIP_START_DIR="${SKIP_START_DIR:-0}"         # 1 = never ask for a start folder
 DEV_TMUX_RESET="${DEV_TMUX_RESET:-1}"         # 0 = do not touch a running server
-CLEAN_ONLY=0
 
 CONF_DIR="$HOME/.config/dev-bootstrap"
 MARKER="# >>> dev-bootstrap >>>"
 MARKER_END="# <<< dev-bootstrap <<<"
-MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
 BACKUP_SUFFIX=".pre-bootstrap"
 START_DIR_STATE="$CONF_DIR/start-dir"   # remembers the answer between runs
 AI_AGENTS_STATE="$CONF_DIR/ai-agents"   # remembers the agent choice between runs
 
 for arg in "$@"; do
   case "$arg" in
-    --clean-only) CLEAN_ONLY=1 ;;
-    # "$0" is "bash" when the script is piped in from curl, and there is no
-    # file to read the help out of — point at the repo instead of failing.
     --help|-h) if [[ -r "$0" ]]; then
                  sed -n '/^# HELP>$/,/^# <HELP$/p' "$0" | sed '1d;$d; s/^# \{0,1\}//'
                else
                  echo "Reading the script from stdin — save it to a file for the help text:"
-                 echo "  curl -fsSL <url> -o dev-bootstrap.sh && bash dev-bootstrap.sh --help"
+                 echo "  curl -fsSL <url> -o dev-bootstrap-user.sh && bash dev-bootstrap-user.sh --help"
                fi
                exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
@@ -237,49 +196,19 @@ login_rc_path() {
   return 1
 }
 
-apt_has()  { apt-cache show "$1" >/dev/null 2>&1; }
-apt_cand() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}'; }
-# Not `apt-cache policy | grep -q`: grep -q quits at the match, apt-cache dies
-# of SIGPIPE writing the rest, and under pipefail that reads as "not
-# installable" — for every package, every time.
-apt_installable() { [[ "$(apt_cand "$1")" == [0-9]* ]]; }
-# dpkg -s also succeeds for a package removed with its config files kept.
-pkg_installed() { [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" == installed ]]; }
-
 # ============================================================== preflight ===
-[[ $EUID -eq 0 ]] && die "Run as your normal user, not root. sudo is used where needed."
-have sudo || die "sudo is required."
-[[ -r /etc/os-release ]] || die "Cannot read /etc/os-release."
-# shellcheck disable=SC1091
-. /etc/os-release
-[[ "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *debian* ]] || die "This script targets Ubuntu/Debian."
-
-OS_VER="${VERSION_ID:-}"
-OS_CODE="${VERSION_CODENAME:-}"
-[[ -z "$OS_CODE" ]] && OS_CODE="$(lsb_release -cs 2>/dev/null || echo unknown)"
-ARCH="$(dpkg --print-architecture)"
-APT_VER="$(apt-get --version 2>/dev/null | head -1 | awk '{print $2}')"
-APT_MAJOR="${APT_VER%%.*}"
-
+[[ $EUID -eq 0 ]] && die "Run as your normal user, not root. The root half is dev-bootstrap-system.sh."
+for t in git jq tmux curl; do
+  have "$t" || die "$t is missing — run dev-bootstrap-system.sh (as root) on this machine first."
+done
 log "Host"
 sub "$(hostname) — user ${USER}"
-sub "${PRETTY_NAME:-unknown}  (${OS_VER} / ${OS_CODE} / ${ARCH})"
-sub "apt ${APT_VER}"
-
-case "$OS_VER" in
-  24.04|26.04) : ;;
-  *) warn "Tested on Ubuntu 24.04 and 26.04; ${OS_VER} may behave differently." ;;
-esac
-# apt >= 3 verifies signatures with sqv and treats duplicate Signed-By values
-# for one repo as a FATAL error that aborts the whole update.
-(( APT_MAJOR >= 3 )) && sub "apt 3.x: strict signature checks, duplicate-source conflicts are fatal"
-
-sudo -v || die "sudo authentication failed."
-while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
-SUDO_KEEPALIVE=$!
-trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null || true' EXIT
 
 mkdir -p "$CONF_DIR" "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+# Ubuntu ships these under alternate binary names.
+[[ -x /usr/bin/fdfind ]] && ln -sf /usr/bin/fdfind "$HOME/.local/bin/fd"
+[[ -x /usr/bin/batcat ]] && ln -sf /usr/bin/batcat "$HOME/.local/bin/bat"
 
 # ------------------------------------------------------------ git identity --
 # Asked here rather than down in the git section: the package installs in
@@ -311,7 +240,7 @@ ask_tty() {                    # ask_tty <varname> <question> <default>
 GIT_IDENT_FROM_ENV=0
 [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]] && GIT_IDENT_FROM_ENV=1
 
-if [[ "$CLEAN_ONLY" != "1" && "$SKIP_GIT_CONF" != "1" \
+if [[ "$SKIP_GIT_CONF" != "1" \
       && "$SKIP_GIT_IDENTITY" != "1" && "$GIT_IDENT_FROM_ENV" != "1" ]]; then
   # git may not be installed yet on a fresh box; an empty default is fine.
   if have git; then
@@ -354,7 +283,7 @@ start_dir_default="$DEV_START_DIR"
 [[ -z "$start_dir_default" && -d "$DEV_ROOT" ]] && start_dir_default="$DEV_ROOT"
 [[ -z "$start_dir_default" ]] && start_dir_default="$HOME"
 
-if [[ "$CLEAN_ONLY" != "1" && "$SKIP_START_DIR" != "1" && -z "$DEV_START_DIR" ]] \
+if [[ "$SKIP_START_DIR" != "1" && -z "$DEV_START_DIR" ]] \
    && (exec </dev/tty) 2>/dev/null; then
   log "Start folder"
   sub "every login starts here: the tmux session opens in it, and so does a"
@@ -399,7 +328,7 @@ DEV_START_DIR="${DEV_START_DIR%/}"; [[ -z "$DEV_START_DIR" ]] && DEV_START_DIR="
   warn "start folder $DEV_START_DIR does not exist — logins will fall back to \$HOME"
 # Remembered so the next run can offer it as the default, and so this stays
 # put when a later run has no terminal to ask from.
-[[ "$CLEAN_ONLY" == "1" ]] || printf '%s\n' "$DEV_START_DIR" > "$START_DIR_STATE" 2>/dev/null || true
+printf '%s\n' "$DEV_START_DIR" > "$START_DIR_STATE" 2>/dev/null || true
 
 # ---------------------------------------------------------- coding agents ---
 # Which AI coding agent to install: Claude Code, OpenAI Codex, both, or none.
@@ -415,7 +344,7 @@ ai_agents_default="$DEV_AI_AGENTS"
   ai_agents_default="$(head -1 "$AI_AGENTS_STATE")"
 [[ -z "$ai_agents_default" ]] && ai_agents_default="claude"
 
-if [[ "$CLEAN_ONLY" != "1" && -z "$DEV_AI_AGENTS" ]] \
+if [[ -z "$DEV_AI_AGENTS" ]] \
    && (exec </dev/tty) 2>/dev/null; then
   log "AI coding agents"
   sub "claude = Claude Code, codex = OpenAI Codex, both, or none"
@@ -446,209 +375,12 @@ INSTALL_CLAUDE=0; INSTALL_CODEX=0
 [[ "$SKIP_CODEX"  == "1" ]] && INSTALL_CODEX=0
 # Remembered so the next run can offer it as the default, and so this stays
 # put when a later run has no terminal to ask from.
-[[ "$CLEAN_ONLY" == "1" ]] || printf '%s\n' "$DEV_AI_AGENTS" > "$AI_AGENTS_STATE" 2>/dev/null || true
-
-# =============================================================== cleanup ====
-# Remove every apt artifact this script family has ever created, in any format,
-# from any release. They are all regenerated below for the release we are on.
-# Sources that were NOT created by us are listed but never touched.
-log "Cleaning up artifacts from previous runs"
-
-LEGACY_SOURCES=(
-  /etc/apt/sources.list.d/mssql-release.list
-  /etc/apt/sources.list.d/mssql-release.sources
-  /etc/apt/sources.list.d/nodesource.list
-  /etc/apt/sources.list.d/nodesource.sources
-  /etc/apt/sources.list.d/pgdg.list
-  /etc/apt/sources.list.d/pgdg.sources
-  /etc/apt/sources.list.d/docker.list
-  /etc/apt/sources.list.d/docker.sources
-  /etc/apt/preferences.d/mssql-release.pref
-)
-LEGACY_KEYS=(
-  /etc/apt/keyrings/microsoft-prod.gpg
-  /etc/apt/keyrings/microsoft.asc
-  /etc/apt/keyrings/nodesource.gpg
-  /etc/apt/keyrings/nodesource.asc
-  /etc/apt/keyrings/pgdg.gpg
-  /etc/apt/keyrings/pgdg.asc
-  /etc/apt/keyrings/docker.gpg
-  /etc/apt/keyrings/docker.asc
-)
-removed=0
-for f in "${LEGACY_SOURCES[@]}" "${LEGACY_KEYS[@]}"; do
-  if [[ -e "$f" ]]; then sudo rm -f "$f"; sub "removed  $f"; removed=$((removed+1)); fi
-done
-# Anything else carrying our marker (e.g. from a future rename) goes too.
-while IFS= read -r f; do
-  [[ -z "$f" ]] && continue
-  sudo rm -f "$f"; sub "removed  $f"; removed=$((removed+1))
-done < <(grep -rls "managed-by: dev-bootstrap" /etc/apt/sources.list.d/ /etc/apt/preferences.d/ 2>/dev/null)
-(( removed == 0 )) && sub "nothing to clean"
-
-log "Third-party apt sources NOT managed by this script (left untouched)"
-foreign=0
-while IFS= read -r f; do
-  [[ -z "$f" ]] && continue
-  foreign=1
-  sub "$(basename "$f")"
-  grep -vE '^\s*(#|$)' "$f" 2>/dev/null | head -4 | sed 's/^/        /'
-done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null \
-         | grep -v 'ubuntu\.sources' | sort)
-(( foreign == 0 )) && sub "(none)"
-
-if [[ "$CLEAN_ONLY" == "1" ]]; then
-  log "Refreshing apt after cleanup"
-  sudo apt-get update 2>&1 | grep -E '^(E|W):' | sed 's/^/    /'
-  log "--clean-only finished. No packages or config were changed."
-  exit 0
-fi
-
-# ------------------------------------------------------------ repo helper --
-# add_repo <file> <uri> <suite> <components> <keyring>
-# Refuses to create a source that duplicates an existing uri+suite, because on
-# apt 3.x two entries for one repo with different Signed-By values abort every
-# subsequent `apt update` with "Conflicting values set for option Signed-By".
-add_repo() {
-  local file="$1" uri="$2" suite="$3" comps="$4" keyring="$5"
-  local existing
-  existing="$(grep -rlsI -- "$uri" /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null \
-              | grep -v "^${file}$" | head -1)"
-  if [[ -n "$existing" ]]; then
-    warn "a source for ${uri} already exists ($existing) — not adding a duplicate"
-    return 1
-  fi
-  sudo tee "$file" >/dev/null <<EOF
-${MANAGED}
-Types: deb
-URIs: ${uri}
-Suites: ${suite}
-Components: ${comps}
-Signed-By: ${keyring}
-EOF
-  return 0
-}
-
-# fetch_keys <dest> <url...>  — concatenated armoured keys; apt accepts several
-fetch_keys() {
-  local dest="$1"; shift
-  local tmp; tmp="$(mktemp)"
-  local u
-  for u in "$@"; do
-    curl -fsSL --max-time 30 "$u" >> "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    printf '\n' >> "$tmp"
-  done
-  local n; n="$(grep -c 'BEGIN PGP PUBLIC KEY BLOCK' "$tmp")"
-  if (( n < $# )); then rm -f "$tmp"; return 1; fi
-  sudo install -d -m 0755 /etc/apt/keyrings
-  sudo install -m 0644 "$tmp" "$dest"
-  rm -f "$tmp"
-  gpg --show-keys --with-colons "$dest" 2>/dev/null | awk -F: '/^fpr:/{print "        key " $10}'
-  return 0
-}
-
-# ========================================================== system packages ==
-if [[ "$SKIP_SYSTEM" != "1" ]]; then
-  log "Updating apt index"
-  sudo apt-get update 2>&1 | grep -E '^(E|W):' | sed 's/^/    /'
-
-  # One list for both releases; anything absent on this release is skipped
-  # rather than failing the whole install.
-  BASE_PKGS=(
-    build-essential pkg-config make cmake
-    git git-lfs gh git-delta
-    curl wget ca-certificates gnupg apt-transport-https software-properties-common lsb-release
-    unzip zip p7zip-full xz-utils zstd unrar-free
-    tmux neovim nano micro less pspg
-    jq yq ripgrep fd-find fzf bat tree eza zoxide direnv vivid sd glow
-    htop btop ncdu iotop lsof strace du-dust duf hyperfine procs
-    net-tools dnsutils iputils-ping traceroute mtr-tiny socat openssh-client rsync
-    mosh gping lnav ttyd fastfetch age tealdeer
-    sqlite3 shellcheck shfmt acl attr
-    bash-completion moreutils just plocate dos2unix pv tokei trash-cli
-    # Newer releases carry these; on older ones the extras section fetches
-    # the GitHub release instead.
-    lazygit starship atuin difftastic trippy
-    xclip wl-clipboard
-    python3 python3-venv python3-pip python3-dev pipx
-    unixodbc unixodbc-dev libssl-dev libffi-dev zlib1g-dev
-  )
-  WANT=(); MISSING=()
-  for p in "${BASE_PKGS[@]}"; do
-    if apt_has "$p"; then WANT+=("$p"); else MISSING+=("$p"); fi
-  done
-  (( ${#MISSING[@]} )) && warn "not available on ${OS_CODE}: ${MISSING[*]}"
-
-  log "Installing ${#WANT[@]} base packages"
-  if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${WANT[@]}"; then
-    warn "bulk install failed — retrying one by one to isolate the problem"
-    for p in "${WANT[@]}"; do
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$p" \
-        >/dev/null 2>&1 || { warn "  could not install: $p"; note_fail "pkg:$p"; }
-    done
-  fi
-
-  # Ubuntu ships these under alternate binary names.
-  [[ -x /usr/bin/fdfind ]] && ln -sf /usr/bin/fdfind "$HOME/.local/bin/fd"
-  [[ -x /usr/bin/batcat ]] && ln -sf /usr/bin/batcat "$HOME/.local/bin/bat"
-  sudo git lfs install --system >/dev/null 2>&1 || true
-fi
+printf '%s\n' "$DEV_AI_AGENTS" > "$AI_AGENTS_STATE" 2>/dev/null || true
 
 # ==================================================================== node ==
-# The newest Node on both releases, from NodeSource: Ubuntu's own is a major or
-# more behind (24.04 has 18, 26.04 has 22). NODE_MAJOR picks the line:
-#   lts      the newest LTS major in nodejs.org's release index (the default)
-#   current  the newest major, LTS or not
-#   <n>      exactly that major
-# The source is rewritten on every run, not only when Node is missing — the
-# cleanup above removed it — so apt keeps Node patched, and a re-run moves up a
-# major as soon as nodejs.org lists one. An installed newer major is kept.
+# Node itself comes from the system half (NodeSource); the globals live in
+# ~/.local, per user.
 if [[ "$SKIP_NODE" != "1" ]]; then
-  if [[ "$NODE_MAJOR" != lts && "$NODE_MAJOR" != current && ! "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
-    warn "NODE_MAJOR='${NODE_MAJOR}' is not lts, current or a major number — using lts"
-    NODE_MAJOR=lts
-  fi
-  node_major="$NODE_MAJOR"
-  [[ "$node_major" =~ ^[0-9]+$ ]] || node_major="$(curl -fsSL --max-time 30 https://nodejs.org/dist/index.json 2>/dev/null \
-    | jq -r --arg ch "$NODE_MAJOR" \
-        'map(select($ch == "current" or .lts))[0].version // empty | ltrimstr("v") | split(".")[0]' 2>/dev/null)"
-  # dpkg, not `node --version`: an nvm or mise node on PATH is not ours.
-  node_have=0
-  pkg_installed nodejs && node_have="$(dpkg-query -W -f='${Version}' nodejs | cut -d. -f1)"
-  [[ "$node_have" =~ ^[0-9]+$ ]] || node_have=0
-  if [[ -z "$node_major" ]]; then
-    warn "could not read the Node release index from nodejs.org"
-    node_major="$node_have"            # still put the installed major's source back
-  fi
-  (( node_have > node_major )) && node_major="$node_have"
-
-  if (( node_major == 0 )); then
-    note_fail "nodejs"
-  elif ! curl -fsI --max-time 20 \
-         "https://deb.nodesource.com/node_${node_major}.x/dists/nodistro/InRelease" >/dev/null 2>&1; then
-    warn "NodeSource has no node_${node_major}.x repo (yet)"; note_fail "nodejs"
-  elif ! fetch_keys /etc/apt/keyrings/nodesource.asc \
-         https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key; then
-    warn "could not fetch the NodeSource key"; note_fail "nodejs"
-  else
-    log "Node.js ${node_major}.x from NodeSource (NODE_MAJOR=${NODE_MAJOR})"
-    add_repo /etc/apt/sources.list.d/nodesource.sources \
-      "https://deb.nodesource.com/node_${node_major}.x" nodistro main \
-      /etc/apt/keyrings/nodesource.asc || true
-    sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-    # Ubuntu's Node packages, if an older run installed them, go in the same
-    # transaction: NodeSource's nodejs conflicts with npm, but shares files
-    # with libnode-dev (/usr/include/node) and node-corepack (/usr/bin/corepack)
-    # without saying so, and dpkg aborts mid-unpack on those.
-    node_drop=()
-    for p in npm libnode-dev node-corepack; do
-      pkg_installed "$p" && node_drop+=("${p}-")
-    done
-    soft "nodejs ${node_major}.x" sudo DEBIAN_FRONTEND=noninteractive \
-      apt-get install -y -qq nodejs "${node_drop[@]}" \
-      && sub "node $(/usr/bin/node --version 2>/dev/null)"
-  fi
-
   if have npm; then
     npm config set prefix "$HOME/.local" >/dev/null 2>&1 || true
     npm config set fund false >/dev/null 2>&1 || true
@@ -713,36 +445,14 @@ if [[ "$SKIP_PYTHON" != "1" ]]; then
 fi
 
 # =================================================================== .NET ===
-# Ubuntu ships .NET itself now (26.04 -> 10.0, 24.04 -> 8.0), and that is the
-# path of least resistance: no extra apt source to conflict with, and security
-# updates arrive with the distro. DOTNET_MAJOR pins one; empty means "newest the
-# distro offers". Only if the distro has none does Microsoft's official
-# installer put a private copy in ~/.dotnet.
+# The SDK comes from the system half when the distro carries one. When it does
+# not, Microsoft's installer puts a private copy in ~/.dotnet.
 if [[ "$SKIP_DOTNET" != "1" ]]; then
-  cur_dotnet="$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | cut -d. -f1 | sort -rn | head -1)"
-  [[ "$cur_dotnet" =~ ^[0-9]+$ ]] || cur_dotnet=0
-  if (( cur_dotnet > 0 )); then
-    log ".NET SDK ${cur_dotnet}.x already present"
-  else
-    dn_pkg=""
-    if [[ -n "$DOTNET_MAJOR" ]]; then
-      apt_installable "dotnet-sdk-${DOTNET_MAJOR}.0" && dn_pkg="dotnet-sdk-${DOTNET_MAJOR}.0"
-      [[ -z "$dn_pkg" ]] && warn "Ubuntu ${OS_VER} has no dotnet-sdk-${DOTNET_MAJOR}.0 — taking what it has"
-    fi
-    if [[ -z "$dn_pkg" ]]; then
-      for dn_m in 10 9 8; do
-        if apt_installable "dotnet-sdk-${dn_m}.0"; then dn_pkg="dotnet-sdk-${dn_m}.0"; break; fi
-      done
-    fi
-    if [[ -n "$dn_pkg" ]]; then
-      log "Installing ${dn_pkg} from Ubuntu ${OS_VER}"
-      soft "$dn_pkg" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$dn_pkg"
-    else
-      log "Ubuntu ${OS_VER} carries no .NET SDK — using Microsoft's installer (~/.dotnet)"
-      soft "dotnet (dot.net installer)" bash -c \
-        'curl -fsSL --max-time 300 https://dot.net/v1/dotnet-install.sh \
-           | bash -s -- --channel LTS --install-dir "$HOME/.dotnet" --no-path' || true
-    fi
+  if ! have dotnet && [[ ! -x "$HOME/.dotnet/dotnet" ]]; then
+    log "No system .NET SDK — using Microsoft's installer (~/.dotnet)"
+    soft "dotnet (dot.net installer)" bash -c \
+      'curl -fsSL --max-time 300 https://dot.net/v1/dotnet-install.sh \
+         | bash -s -- --channel LTS --install-dir "$HOME/.dotnet" --no-path' || true
   fi
 
   # Global tools live in ~/.dotnet/tools. csharp-ls is not optional decoration:
@@ -793,117 +503,9 @@ if [[ "$INSTALL_CODEX" == "1" ]]; then
 fi
 
 # ============================================================ extra tools ===
-# Tools that make a headless box pleasant, installed the same way the base
-# packages are: from apt when this release carries them (they are in BASE_PKGS
-# for that reason), and otherwise from the project's latest GitHub release. A
-# .deb asset is preferred and goes through apt, so it is tracked and brings its
-# man page; anything else is unpacked and the binary put in ~/.local/bin.
-#
-# Already-present tools are left alone — there is no upgrade path for a binary
-# that did not come from apt, except DEV_EXTRAS_UPGRADE=1, which re-fetches all
-# of them.
-case "$ARCH" in
-  amd64) ARCH_RUST=x86_64;  ARCH_CROC=64bit ;;
-  arm64) ARCH_RUST=aarch64; ARCH_CROC=ARM64 ;;
-  *)     ARCH_RUST="$ARCH"; ARCH_CROC="$ARCH" ;;
-esac
-ARCH_RE="(${ARCH}|${ARCH_RUST})"     # projects name the arch either way
-
-# gh_asset_url <repo> <regex> — download URL of the first matching asset of the
-# latest release. An authenticated gh dodges the 60/hour anonymous API limit.
-gh_asset_url() {
-  local repo="$1" re="$2" json=""
-  if have gh && gh auth token >/dev/null 2>&1; then
-    json="$(gh api "repos/${repo}/releases/latest" 2>/dev/null)"
-  fi
-  [[ -n "$json" ]] || json="$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' \
-                         "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)"
-  [[ -n "$json" ]] || return 1
-  jq -r '.assets[]?.browser_download_url' <<<"$json" 2>/dev/null | grep -E "$re" | head -1 | grep .
-}
-
-# gh_bin <repo> <asset-regex> <binary> [binary...]
-gh_bin() {
-  local repo="$1" re="$2"; shift 2
-  local main="$1" url tmpd file rc=0 b found owner copy cv av
-  # Packaged in /usr/bin by a repo apt follows (this release carries it, or
-  # the box was upgraded to one that does): apt keeps it current. A copy of
-  # ours in ~/.local/bin that is no newer only hides it, so it goes. A newer
-  # copy stays: going back a version can break data the newer one already
-  # migrated (atuin's history.db does exactly that).
-  if owner="$(dpkg-query -S "/usr/bin/$main" 2>/dev/null)" \
-     && [[ -n "$(apt-cache madison "${owner%%:*}" 2>/dev/null)" ]]; then
-    owner="${owner%%:*}"; copy="$HOME/.local/bin/$main"
-    if [[ -f "$copy" && ! -L "$copy" ]]; then
-      cv="$("$copy" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
-      av="$(dpkg-query -W -f='${Version}' "$owner" 2>/dev/null)"
-      if [[ -n "$cv" ]] && dpkg --compare-versions "${av#*:}" ge "$cv"; then
-        for b in "$@"; do
-          [[ -f "$HOME/.local/bin/$b" && ! -L "$HOME/.local/bin/$b" ]] || continue
-          rm -f "$HOME/.local/bin/$b"
-          sub "removed ~/.local/bin/$b — ${owner} ${av} from apt is at least as new"
-        done
-      fi
-    fi
-    if [[ ! -f "$copy" || -L "$copy" ]]; then
-      sub "$(printf '%-11s' "$main") from apt (${owner})"; return 0
-    fi
-  fi
-  if [[ "$DEV_EXTRAS_UPGRADE" != "1" ]] && have "$main"; then
-    sub "$(printf '%-11s' "$main") already present"; return 0
-  fi
-  if ! url="$(gh_asset_url "$repo" "$re")"; then
-    warn "${main}: no release asset for ${ARCH} in ${repo} (or the GitHub API is rate-limited)"
-    note_fail "$main"; return 1
-  fi
-  tmpd="$(mktemp -d)"; file="${tmpd}/${url##*/}"
-  if ! curl -fsSL --max-time 300 -o "$file" "$url"; then
-    warn "${main}: download failed — ${url}"; note_fail "$main"; rm -rf "$tmpd"; return 1
-  fi
-  case "$file" in
-    *.deb)           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$file" >/dev/null 2>&1 || rc=1 ;;
-    *.tar.gz|*.tgz)  tar xzf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
-    *.tar.xz)        tar xJf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
-    *.tar.bz2)       tar xjf "$file" -C "$tmpd" 2>/dev/null || rc=1 ;;
-    *.zip)           unzip -qo "$file" -d "$tmpd" 2>/dev/null || rc=1 ;;
-    *)               mv "$file" "${tmpd}/${main}" ;;            # a bare binary
-  esac
-  if (( rc == 0 )) && [[ "$file" != *.deb ]]; then
-    for b in "$@"; do
-      found="$(find "$tmpd" -type f -name "$b" | head -1)"
-      if [[ -n "$found" ]]; then
-        install -m 0755 "$found" "$HOME/.local/bin/$b"
-      else
-        warn "${main}: ${b} is not in the archive"; rc=1
-      fi
-    done
-  fi
-  rm -rf "$tmpd"
-  if (( rc == 0 )); then
-    sub "$(printf '%-11s' "$main") ${url##*/}"
-  else
-    warn "could not install ${main}"; note_fail "$main"
-  fi
-  return "$rc"
-}
-
+# The tools themselves come from the system half; what is per user is here.
 if [[ "$SKIP_EXTRAS" != "1" ]]; then
-  log "Extra tools (apt where the release has them, GitHub releases otherwise)"
-  export PATH="$HOME/.local/bin:$PATH"
-  gh_bin jesseduffield/lazygit     "lazygit_.*_linux_${ARCH_RE}\.tar\.gz$"                 lazygit
-  gh_bin starship/starship         "starship-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"      starship
-  gh_bin atuinsh/atuin             "/atuin-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"        atuin
-  gh_bin watchexec/watchexec       "watchexec-.*-${ARCH_RUST}-unknown-linux-gnu\.deb$"      watchexec
-  gh_bin Wilfred/difftastic        "difft-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz$"         difft
-  gh_bin sxyazi/yazi               "yazi-${ARCH_RUST}-unknown-linux-gnu\.deb$"              yazi ya
-  gh_bin fujiapple852/trippy       "(trippy_.*_${ARCH}\.deb|trippy-.*-${ARCH_RUST}-unknown-linux-gnu\.tar\.gz)$" trip
-  gh_bin o2sh/onefetch             "onefetch_${ARCH}\.deb$"                                 onefetch
-  gh_bin PaulJuliusMartinez/jless  "jless-.*-${ARCH_RUST}-unknown-linux-gnu\.zip$"          jless
-  gh_bin schollz/croc              "/croc_.*_Linux-${ARCH_CROC}\.tar\.gz$"                  croc
-  gh_bin getsops/sops              "sops_.*_${ARCH}\.deb$"                                  sops
-  gh_bin fastfetch-cli/fastfetch   "fastfetch-linux-${ARCH_RE}\.deb$"                       fastfetch
-  gh_bin dalance/procs             "procs-.*-${ARCH_RUST}-linux\.zip$"                      procs
-
+  log "Extra tools (per-user parts)"
   # mise: one version manager for node/python/go/... driven by a .mise.toml in
   # the project. It does nothing until a project pins a tool, so the apt node
   # and dotnet stay the defaults. Its own installer, because the release
@@ -927,12 +529,6 @@ if [[ "$SKIP_EXTRAS" != "1" ]]; then
       || { rm -f "$CONF_DIR/bash-preexec.sh.new"; warn "could not fetch bash-preexec — atuin will not record history"; note_fail "bash-preexec"; }
   fi
 
-  # trippy opens raw sockets; the capability saves running it under sudo.
-  if have trip; then
-    sudo setcap cap_net_raw+ep "$(command -v trip)" 2>/dev/null \
-      || sub "trip: could not set cap_net_raw — run it with sudo"
-  fi
-
   # tealdeer needs its page cache before the first `tldr`.
   have tldr && { tldr --update >/dev/null 2>&1 || warn "tldr: could not fetch the page cache"; }
 
@@ -940,69 +536,6 @@ if [[ "$SKIP_EXTRAS" != "1" ]]; then
   # the first shell rather than starting empty.
   if have atuin && [[ ! -s "$HOME/.local/share/atuin/history.db" ]]; then
     atuin import auto >/dev/null 2>&1 && sub "$(printf '%-11s' atuin) imported ~/.bash_history"
-  fi
-fi
-
-# ================================================================= docker ===
-# Docker's own repo first: it carries buildx and the compose plugin as current
-# releases, and tracks new Ubuntu versions within weeks. Until it does (or if
-# the repo is unreachable) Ubuntu's own docker.io + docker-compose-v2 serve —
-# same CLI, slightly older.
-#
-# An installed docker-ce gets Docker's source back on every run (the cleanup
-# above removed it), so `apt upgrade` keeps it current. It is not upgraded
-# here: that restarts dockerd, and every running container with it.
-if [[ "$SKIP_DOCKER" != "1" ]]; then
-  docker_ce=0; pkg_installed docker-ce && docker_ce=1
-  if have docker && (( ! docker_ce )); then
-    log "Docker already present ($(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,))"
-  else
-    docker_done=0
-    if (( docker_ce )); then
-      log "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,) — keeping download.docker.com configured"
-    else
-      log "Installing Docker"
-    fi
-    if curl -fsI --max-time 20 \
-         "https://download.docker.com/linux/ubuntu/dists/${OS_CODE}/InRelease" >/dev/null 2>&1 \
-       && fetch_keys /etc/apt/keyrings/docker.asc https://download.docker.com/linux/ubuntu/gpg; then
-      if add_repo /etc/apt/sources.list.d/docker.sources \
-           "https://download.docker.com/linux/ubuntu" "$OS_CODE" stable \
-           /etc/apt/keyrings/docker.asc; then
-        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-      fi
-      if (( docker_ce )); then
-        docker_done=1                    # installed; the source was all it lacked
-      elif apt_installable docker-ce; then
-        sub "docker-ce $(apt_cand docker-ce) from download.docker.com (${OS_CODE})"
-        soft "docker-ce" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-          docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-          && docker_done=1
-      else
-        warn "the Docker repo offers no docker-ce for ${OS_CODE} — removing it again"
-        sudo rm -f /etc/apt/sources.list.d/docker.sources
-        sudo apt-get update -qq >/dev/null 2>&1 || true
-      fi
-    else
-      sub "download.docker.com has no ${OS_CODE} suite yet"
-    fi
-    if (( ! docker_done && ! docker_ce )); then
-      sub "installing Ubuntu's docker.io ($(apt_cand docker.io)) with compose v2 and buildx"
-      soft "docker.io" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        docker.io docker-compose-v2 docker-buildx || true
-    fi
-  fi
-
-  if have docker; then
-    sudo systemctl enable --now docker >/dev/null 2>&1 || true
-    if getent group docker >/dev/null 2>&1 && ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-      sudo usermod -aG docker "$USER" \
-        && warn "added ${USER} to the docker group — takes effect at the next login" \
-        || warn "could not add ${USER} to the docker group"
-    fi
-    # dive inspects image layers; lazydocker is a TUI over containers/compose.
-    gh_bin wagoodman/dive           "dive_.*_linux_${ARCH}\.deb$"                 dive
-    gh_bin jesseduffield/lazydocker "lazydocker_.*_Linux_${ARCH_RE}\.tar\.gz$"    lazydocker
   fi
 fi
 
@@ -2786,417 +2319,14 @@ GITIGNORE
 gitset core.excludesfile "$HOME/.gitignore_global"
 fi
 
-# ================================================== microsoft sql tooling ===
-# What the Microsoft repos actually carry is probed live below; as of this
-# writing:
-#   ubuntu/24.04/prod (noble)     -> msodbcsql18 + mssql-tools18, plus ~100
-#                                    unrelated packages (powershell, moby, ...)
-#   ubuntu/25.10/prod (questing)  -> msodbcsql18 + mssql-tools18 and nothing else
-#   ubuntu/26.04/prod (resolute)  -> exists and signs, but carries only the
-#                                    container/Azure packages — no SQL tooling
-# So on 26.04 we install packages built for an older release. They run fine:
-# both depend on nothing but libc6, libstdc++6, libkrb5-3, openssl and debconf.
-#
-# Three routes are tried in order, because the repo route has many moving parts
-# (keys, suites, Signed-By conflicts, pinning) and any of them can already be
-# broken on a machine that has met another Microsoft installer:
-#   1. a Microsoft repo that is already configured here and already offers it
-#   2. our own source for the newest suite that really carries the packages
-#   3. the .deb files straight from the pool, checksum-verified and installed
-#      with `apt-get install ./file.deb`, so apt still resolves dependencies
-#      but nothing depends on repo metadata, signing keys or pinning
-# If all three fail, go-sqlcmd (a static binary: sqlcmd, but no bcp, no driver).
-MS_BIN=/opt/mssql-tools18/bin
 
-# Both packages gate their *preinst* on a debconf answer, and a preinst that
-# refuses aborts the whole apt transaction. ACCEPT_EULA in the environment is
-# Microsoft's documented way in, but it only reaches the maintainer script if
-# sudo passes it through — which is why every install below goes through
-# `sudo env`. Seeding the answers as well covers the case where the config
-# script never runs (a plain `dpkg -i`, or a package configured out of band).
-ms_eula_preseed() {
-  have debconf-set-selections || return 0
-  printf '%s\n' \
-    'msodbcsql18 msodbcsql/ACCEPT_EULA boolean true' \
-    'msodbcsql18 msodbcsql/accept_eula boolean true' \
-    'mssql-tools18 mssql-tools/accept_eula boolean true' \
-    | sudo debconf-set-selections 2>/dev/null
-}
-
-# ms_apt_install <target...> — targets are package names or local .deb paths.
-# Only mssql-tools18 is ever named: msodbcsql18 comes along as its dependency
-# when it is missing and is left alone when it is already installed. Asking for
-# msodbcsql18 by name would make apt reinstall it, and its preinst aborts the
-# transaction with "ODBC Driver 18 for SQL Server detected!" when the driver is
-# already registered with odbcinst.
-ms_apt_install() {
-  sudo env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y -qq "$@"
-}
-
-# ms_newest <packages-index> <package> -> "version<TAB>filename<TAB>sha256"
-# The pool indexes keep every version ever published, in no useful order, so
-# the winner is picked with dpkg's own version comparison rather than sort.
-ms_newest() {
-  local idx="$1" want="$2" best="" bestline="" v f s
-  while IFS=$'\t' read -r v f s; do
-    [[ -z "$v" || -z "$f" || -z "$s" ]] && continue
-    if [[ -z "$best" ]] || dpkg --compare-versions "$v" gt "$best"; then
-      best="$v"; bestline="${v}"$'\t'"${f}"$'\t'"${s}"
-    fi
-  done < <(awk -v want="$want" '
-      function flush() {
-        if (p == want && v != "" && f != "" && s != "") print v "\t" f "\t" s
-        p=""; v=""; f=""; s=""
-      }
-      /^Package: /  { flush(); p=$2 }
-      /^Version: /  { if (p==want) v=$2 }
-      /^Filename: / { if (p==want) f=$2 }
-      /^SHA256: /   { if (p==want) s=$2 }
-      END           { flush() }
-    ' "$idx")
-  [[ -n "$bestline" ]] || return 1
-  printf '%s\n' "$bestline"
-}
-
-# ms_pool_install <base-url> <packages-index>
-ms_pool_install() {
-  local base="$1" idx="$2" tmpd pkg line ver file sha rc=0
-  tmpd="$(mktemp -d)" || return 1
-  local debs=()
-  for pkg in msodbcsql18 mssql-tools18; do
-    # Skip the driver when it is already installed — see ms_apt_install.
-    [[ "$pkg" == msodbcsql18 ]] && pkg_installed msodbcsql18 && continue
-    if ! line="$(ms_newest "$idx" "$pkg")"; then
-      warn "${pkg} is not in the pool index"; rc=1; break
-    fi
-    IFS=$'\t' read -r ver file sha <<<"$line"
-    sub "downloading ${pkg} ${ver}"
-    if ! curl -fsSL --max-time 300 -o "${tmpd}/${pkg}.deb" "${base}/${file}"; then
-      warn "download failed: ${base}/${file}"; rc=1; break
-    fi
-    if ! printf '%s  %s\n' "$sha" "${tmpd}/${pkg}.deb" | sha256sum -c --status; then
-      warn "checksum mismatch for ${pkg} ${ver} — refusing to install it"; rc=1; break
-    fi
-    debs+=("${tmpd}/${pkg}.deb")
-  done
-  if (( rc == 0 )) && (( ${#debs[@]} )); then
-    ms_apt_install "${debs[@]}" || rc=1
-  fi
-  rm -rf "$tmpd"
-  return "$rc"
-}
-
-if [[ "$SKIP_MSSQL" != "1" ]]; then
-  # An installed copy still goes through the probe and route 2: the cleanup
-  # above removed its source, and route 2 is what puts it back so apt keeps it
-  # patched. Route 3 and go-sqlcmd are only for a missing sqlcmd.
-  ms_done=0; ms_have=0
-  if [[ -x "$MS_BIN/sqlcmd" ]]; then
-    log "sqlcmd already installed — putting its apt source back"
-    sub "$MS_BIN/sqlcmd  ($(dpkg-query -W -f='${Version}' mssql-tools18 2>/dev/null || echo 'not from a package'))"
-    ms_have=1
-  else
-    log "Installing the Microsoft SQL tooling"
-  fi
-  ms_eula_preseed
-
-  # ---- route 1: a Microsoft repo that is already configured here ----------
-  # Not for an installed copy: apt offers that as its own candidate even with
-  # no source behind it, which would pass for "reachable" here.
-  if (( ! ms_have )) && apt_installable mssql-tools18; then
-    sub "already reachable from a configured repo (candidate $(apt_cand mssql-tools18))"
-    ms_apt_install mssql-tools18 && ms_done=1
-    (( ms_done )) || warn "that repo could not deliver the package — trying the other routes"
-  fi
-
-  # ---- probe: which suite actually carries the packages? ------------------
-  # Asked over plain HTTPS, so a broken apt configuration cannot produce a
-  # false negative, and the index we get is reused by route 3.
-  ms_base=""; ms_idx=""; ms_suite=""; ms_relver=""; ms_tried=" "
-  if (( ! ms_done )); then
-    ms_probe="$(mktemp)"
-    for pair in "${OS_VER}:${OS_CODE}" "25.10:questing" "24.04:noble" "22.04:jammy"; do
-      p_ver="${pair%%:*}"; p_suite="${pair##*:}"
-      [[ -z "$p_ver" || -z "$p_suite" ]] && continue
-      [[ "$ms_tried" == *" ${p_ver}/${p_suite} "* ]] && continue
-      ms_tried+="${p_ver}/${p_suite} "
-      printf '    %-16s ' "${p_ver}/${p_suite}"
-      if ! curl -fsSL --max-time 60 -o "$ms_probe" \
-           "https://packages.microsoft.com/ubuntu/${p_ver}/prod/dists/${p_suite}/main/binary-${ARCH}/Packages" 2>/dev/null; then
-        echo "no package index"; continue
-      fi
-      ms_t="$(grep -c '^Package: mssql-tools18$' "$ms_probe")"
-      ms_o="$(grep -c '^Package: msodbcsql18$'  "$ms_probe")"
-      echo "mssql-tools18=${ms_t} msodbcsql18=${ms_o}"
-      (( ms_t > 0 && ms_o > 0 )) || continue
-      ms_relver="$p_ver"; ms_suite="$p_suite"
-      ms_base="https://packages.microsoft.com/ubuntu/${p_ver}/prod"
-      ms_idx="$(mktemp)"; cp "$ms_probe" "$ms_idx"
-      break
-    done
-    rm -f "$ms_probe"
-    [[ -n "$ms_base" && "$ms_relver" != "$OS_VER" ]] && \
-      warn "Microsoft has no Ubuntu ${OS_VER} build — using the ${ms_relver} (${ms_suite}) packages"
-  fi
-
-  # ---- route 2: our own source for that suite -----------------------------
-  if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
-    if fetch_keys /etc/apt/keyrings/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft-2025.asc; then
-      if add_repo /etc/apt/sources.list.d/mssql-release.sources \
-           "$ms_base" "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
-        # A repo for another release must not become a general-purpose source:
-        # noble/prod alone carries ~100 packages (powershell, moby, kubectl)
-        # built for the wrong Ubuntu. Pin the whole suite out of reach and let
-        # only the two SQL packages back through.
-        if [[ "$ms_suite" != "$OS_CODE" ]]; then
-          sudo tee /etc/apt/preferences.d/mssql-release.pref >/dev/null <<EOF
-${MANAGED}
-Package: *
-Pin: release n=${ms_suite}
-Pin-Priority: 1
-
-Package: msodbcsql18 mssql-tools18
-Pin: release n=${ms_suite}
-Pin-Priority: 500
-EOF
-          sub "pinned: only msodbcsql18/mssql-tools18 may come from ${ms_suite}"
-        fi
-        sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-        if apt_installable mssql-tools18; then
-          sub "candidate $(apt_cand mssql-tools18) from ${ms_relver}/${ms_suite}"
-          ms_apt_install mssql-tools18 && ms_done=1
-        else
-          warn "the ${ms_suite} source produced no installable candidate — removing it again"
-          sudo rm -f /etc/apt/sources.list.d/mssql-release.sources \
-                     /etc/apt/preferences.d/mssql-release.pref
-          sudo apt-get update -qq >/dev/null 2>&1 || true
-        fi
-      fi
-    else
-      warn "could not download the Microsoft signing keys"
-    fi
-  fi
-
-  # ---- route 3: the .deb files straight from the pool ---------------------
-  if (( ! ms_done && ! ms_have )) && [[ -n "$ms_base" ]]; then
-    warn "repo route did not work — installing the .deb files from the pool"
-    ms_pool_install "$ms_base" "$ms_idx" && ms_done=1
-  fi
-  [[ -n "$ms_idx" ]] && rm -f "$ms_idx"
-
-  # ---- last resort: go-sqlcmd --------------------------------------------
-  if (( ! ms_done && ! ms_have )); then
-    [[ -n "$ms_base" ]] || warn "no Microsoft repo carries mssql-tools18 for ${ARCH}"
-    warn "falling back to go-sqlcmd (static binary: sqlcmd only — no bcp, no ODBC driver)"
-    if curl -fsSL --max-time 300 \
-         "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2" \
-         | tar xj -C "$HOME/.local/bin" sqlcmd 2>/dev/null; then
-      sub "installed $HOME/.local/bin/sqlcmd"
-      note_fail "mssql-tools18 (go-sqlcmd installed instead)"
-    else
-      warn "that failed too — this machine has no sqlcmd"
-      note_fail "mssql-tools18"
-    fi
-  fi
-
-  # The go-sqlcmd fallback from an earlier run would hide the real sqlcmd:
-  # rc.sh puts ~/.local/bin first on PATH and /opt/mssql-tools18/bin last.
-  if [[ -x "$MS_BIN/sqlcmd" && -f "$HOME/.local/bin/sqlcmd" && ! -L "$HOME/.local/bin/sqlcmd" ]]; then
-    rm -f "$HOME/.local/bin/sqlcmd"
-    sub "removed the go-sqlcmd fallback from ~/.local/bin — mssql-tools18 replaces it"
-  fi
-
-  # /opt/mssql-tools18/bin is on no one's PATH by default; rc.sh appends it when
-  # the directory exists, so a login shell picks it up from the next start.
-  # Checked by what it prints rather than by its exit status: `sqlcmd -?` is a
-  # usage screen, and usage screens are not required to exit 0.
-  if [[ -x "$MS_BIN/sqlcmd" ]]; then
-    ms_v="$("$MS_BIN/sqlcmd" -? 2>&1 | awk '/Version/{print $2; exit}')"
-    if [[ -n "$ms_v" ]]; then
-      sub "sqlcmd ${ms_v} — ${MS_BIN}/sqlcmd (on PATH from the next login shell)"
-    else
-      warn "sqlcmd is installed at ${MS_BIN}/sqlcmd but did not report a version"
-    fi
-  fi
-fi
-
-# ============================================================== postgres ====
-# PGDG carries a new Ubuntu release only some months after launch, so probe
-# before trusting it. Ubuntu 26.04's own client is current anyway.
-#
-# The PGDG source is rewritten on every run, not only when psql is missing —
-# the cleanup above removed it — so apt keeps the client and libpq patched.
-# PG_MAJOR empty takes the newest client on offer: pg_dump refuses to dump a
-# server newer than itself, so the newest client works against every server.
-if [[ "$SKIP_POSTGRES" != "1" ]]; then
-  pg_suite="${OS_CODE}-pgdg"
-  if curl -fsI --max-time 20 \
-       "https://apt.postgresql.org/pub/repos/apt/dists/${pg_suite}/InRelease" >/dev/null 2>&1 \
-     && fetch_keys /etc/apt/keyrings/pgdg.asc \
-          https://www.postgresql.org/media/keys/ACCC4CF8.asc; then
-    if add_repo /etc/apt/sources.list.d/pgdg.sources \
-         "https://apt.postgresql.org/pub/repos/apt" "$pg_suite" main \
-         /etc/apt/keyrings/pgdg.asc; then
-      sudo apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-    fi
-    pg_pkg="postgresql-client-${PG_MAJOR}"
-    [[ -n "$PG_MAJOR" ]] || pg_pkg="$(apt-cache pkgnames postgresql-client- 2>/dev/null \
-                                      | grep -E '^postgresql-client-[0-9]+$' | sort -V | tail -1)"
-    if [[ -n "$pg_pkg" ]] && apt_installable "$pg_pkg"; then
-      log "PostgreSQL client: ${pg_pkg} (PGDG ${pg_suite})"
-      soft "$pg_pkg" sudo DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y -qq "$pg_pkg" libpq-dev || true
-      # Older clients are superseded, not deleted: marked automatic, they go with
-      # the next `apt autoremove` — unless a local server of that major needs them.
-      for p in $(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'postgresql-client-[0-9]*' 2>/dev/null \
-                 | awk '$1 == "installed" {print $2}'); do
-        [[ "$p" == "$pg_pkg" ]] || sudo apt-mark auto "$p" >/dev/null 2>&1
-      done
-    else
-      warn "PGDG has no ${pg_pkg:-postgresql-client} here — using Ubuntu's"
-      soft "postgresql-client" sudo DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y -qq postgresql-client libpq-dev || true
-    fi
-  elif have psql; then
-    log "psql $(psql --version | awk '{print $3}') already present (no PGDG repo for ${OS_CODE})"
-  else
-    log "No PGDG repo for ${OS_CODE} — using Ubuntu's postgresql-client ($(apt_cand postgresql-client))"
-    soft "postgresql-client" sudo DEBIAN_FRONTEND=noninteractive \
-      apt-get install -y -qq postgresql-client libpq-dev || true
-  fi
-fi
-
-# ======================================================== system tuning =====
-if [[ "$SKIP_SYSCTL" != "1" ]]; then
-  log "Raising inotify limits (file watchers + agentic tooling)"
-  printf '%s\n' \
-    '# managed-by: dev-bootstrap' \
-    'fs.inotify.max_user_watches=524288' \
-    'fs.inotify.max_user_instances=1024' \
-    'fs.inotify.max_queued_events=32768' \
-    | sudo tee /etc/sysctl.d/60-inotify.conf >/dev/null
-  sudo sysctl --system >/dev/null 2>&1 || true
-
-  # Ubuntu's default soft limit is 1024 open files. tsc --watch, vite, pytest-xdist
-  # and several language servers at once blow through that and fail with EMFILE.
-  log "Raising the open-file limit (default soft limit is 1024)"
-  printf '%s\n' \
-    '# managed-by: dev-bootstrap' \
-    '*  soft  nofile  65535' \
-    '*  hard  nofile  1048576' \
-    | sudo tee /etc/security/limits.d/90-dev-nofile.conf >/dev/null
-  sub "currently: soft=$(ulimit -Sn) hard=$(ulimit -Hn) (new value applies at next login)"
-
+# ===================================================================== ssh ===
   if ! grep -q "ServerAliveInterval" "$HOME/.ssh/config" 2>/dev/null; then
     mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
     printf 'Host *\n    ServerAliveInterval 60\n    ServerAliveCountMax 5\n    AddKeysToAgent yes\n' \
       >> "$HOME/.ssh/config"
     chmod 600 "$HOME/.ssh/config"
   fi
-fi
-
-# ============================================================== hardening ===
-# The three things a box with an SSH port deserves, kept deliberately modest:
-#   unattended-upgrades   security updates install themselves
-#   fail2ban              bans an IP after repeated failed SSH logins
-#   ufw                   deny incoming by default; SSH (and mosh) open from
-#                         everywhere, everything open from DEV_UFW_TRUST
-# DEV_UFW_TRUST is empty by default, so any other port (an app, a dev server)
-# must be opened on purpose: `sudo ufw allow from <proxy-ip> to any port <p>`.
-# Docker publishes ports through its own iptables chain and bypasses ufw
-# entirely — bind containers to 127.0.0.1 unless they must be reachable.
-if [[ "$SKIP_HARDENING" != "1" ]]; then
-  log "Hardening: unattended-upgrades, fail2ban, ufw"
-  hard_pkgs=()
-  for p in unattended-upgrades fail2ban ufw; do
-    pkg_installed "$p" || { apt_has "$p" && hard_pkgs+=("$p"); }
-  done
-  (( ${#hard_pkgs[@]} )) && soft "hardening packages" sudo DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y -qq --no-install-recommends "${hard_pkgs[@]}"
-
-  # ---- unattended-upgrades -------------------------------------------------
-  if pkg_installed unattended-upgrades; then
-    printf '%s\n' \
-      "// ${MANAGED#\# }" \
-      'APT::Periodic::Update-Package-Lists "1";' \
-      'APT::Periodic::Unattended-Upgrade "1";' \
-      'APT::Periodic::AutocleanInterval "7";' \
-      | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
-    sudo systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
-    sub "unattended-upgrades: security updates daily (Ubuntu's default origins)"
-  fi
-
-  # ---- fail2ban ------------------------------------------------------------
-  # backend=systemd: Ubuntu ships no rsyslog any more, so /var/log/auth.log is
-  # often missing and the stock jail then refuses to start.
-  if pkg_installed fail2ban; then
-    sudo tee /etc/fail2ban/jail.d/dev-bootstrap-sshd.local >/dev/null <<EOF
-${MANAGED}
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1 ${DEV_UFW_TRUST}
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-
-[sshd]
-enabled = true
-backend = systemd
-EOF
-    sudo systemctl enable fail2ban >/dev/null 2>&1 || true
-    if sudo systemctl restart fail2ban >/dev/null 2>&1; then
-      sub "fail2ban: sshd jail on, 5 failures in 10 min = 1 h ban (trusted ranges ignored)"
-    else
-      warn "fail2ban did not start — journalctl -u fail2ban"; note_fail "fail2ban"
-    fi
-  fi
-
-  # ---- ufw -----------------------------------------------------------------
-  # SSH is allowed BEFORE the firewall is enabled, on whatever port sshd is
-  # really listening on, and enabling is skipped if that rule could not be
-  # added. `ufw allow` is idempotent, so a re-run only reports existing rules.
-  if have ufw; then
-    ssh_ports="$(sudo sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ')"
-    [[ -z "$ssh_ports" ]] && ssh_ports="22 "
-    ufw_ok=1
-    for p in $ssh_ports; do
-      sudo ufw allow "${p}/tcp" comment 'ssh' >/dev/null 2>&1 || ufw_ok=0
-    done
-    have mosh && sudo ufw allow 60000:61000/udp comment 'mosh' >/dev/null 2>&1
-    for net in $DEV_UFW_TRUST; do
-      sudo ufw allow from "$net" comment 'trusted (dev-bootstrap)' >/dev/null 2>&1 \
-        || warn "ufw: could not add the trusted range ${net}"
-    done
-    # Drop trusted ranges an earlier run added that DEV_UFW_TRUST no longer
-    # lists (older versions trusted all of RFC 1918 by default).
-    for net in $(sudo ufw show added 2>/dev/null \
-                 | awk '/^ufw allow from .*trusted \(dev-bootstrap\)/{print $4}' | sort -u); do
-      [[ " $DEV_UFW_TRUST " == *" $net "* ]] && continue
-      if sudo ufw delete allow from "$net" >/dev/null 2>&1; then
-        sub "ufw: removed the old trusted range ${net}"
-      else
-        warn "ufw: could not remove the old trusted range ${net}"
-      fi
-    done
-    if (( ufw_ok )); then
-      if sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
-        sub "ufw: already active — rules refreshed (ssh ${ssh_ports}tcp, trusted: ${DEV_UFW_TRUST:-none})"
-      else
-        sudo ufw default deny incoming  >/dev/null 2>&1
-        sudo ufw default allow outgoing >/dev/null 2>&1
-        if sudo ufw --force enable >/dev/null 2>&1; then
-          sub "ufw: enabled — incoming denied except ssh (${ssh_ports}tcp), trusted: ${DEV_UFW_TRUST:-none}"
-        else
-          warn "ufw could not be enabled"; note_fail "ufw"
-        fi
-      fi
-    else
-      warn "ufw: the ssh rule could not be added — NOT enabling the firewall"; note_fail "ufw"
-    fi
-  fi
-fi
 
 # ====================================================== shared dev folder ===
 if [[ -d "$DEV_ROOT" ]] && getent group "$DEV_GROUP" >/dev/null 2>&1; then
@@ -3206,93 +2336,37 @@ if [[ -d "$DEV_ROOT" ]] && getent group "$DEV_GROUP" >/dev/null 2>&1; then
 fi
 
 # ============================================================== leftovers ===
-# What nothing uses any more goes, so every run lands on the same clean box:
-#   * dangling links in ~/.local/bin — an npm or pipx tool removed under them
-#   * packages apt pulled in only for something since removed (Ubuntu's npm
-#     and its node-* libraries, old kernels, a superseded psql client):
-#     `apt autoremove --purge`
-#   * what removed kernels and Node packages left behind (dpkg state "rc")
-#
-# Kept whatever apt thinks of them, because purging them destroys data: a
-# database server (postgresql-NN deletes its clusters on purge — the debconf
-# default is yes) and Docker (purging docker.io wipes /var/lib/docker, volumes
-# included). The bootloader stays too: purging grub-pc deletes
-# /etc/default/grub, which grub-efi reads as well. Other "rc" leftovers were
-# removed by someone, by hand, and may hold data of their own — listed, not
-# purged. SKIP_AUTOREMOVE=1 lists the apt part and changes nothing.
-LEFTOVER_KEEP_RE='^(postgresql-[0-9]+|mysql-server.*|mariadb-server.*|mssql-server|redis-server|mongodb.*|docker.*|containerd.*|grub.*|shim.*)$'
-LEFTOVER_PURGE_RE='^(linux-.*|npm|libnode.*|node-.*|libjs-.*|javascript-common)$'
-apt_orphans() { apt-get -s autoremove 2>/dev/null | awk '/^Remv /{sub(/:.*/, "", $2); print $2}'; }
-list12() {                     # list12 <lines> -> "N: a b c ..." on one line
-  local n; n="$(wc -l <<<"$1")"
-  printf '%s: %s%s' "$n" "$(head -12 <<<"$1" | tr '\n' ' ')" "$( (( n > 12 )) && echo '...')"
-}
-
+# Dangling links in ~/.local/bin (an npm or pipx tool removed under them), and
+# copies an older, single-script bootstrap put there that the system half now
+# installs for everyone: ~/.local/bin is first on PATH, so a stale copy hides
+# the system one. A copy that is NEWER than the system one stays — going back
+# a version can break data the newer one already migrated (atuin's history.db).
 log "Removing what nothing uses any more"
 left_n=0
 while IFS= read -r f; do
   [[ -n "$f" ]] || continue
   rm -f "$f"; sub "removed dangling link $(hp "$f")"; left_n=$((left_n+1))
 done < <(find "$HOME/.local/bin" -maxdepth 1 -xtype l 2>/dev/null)
-
-orphans="$(apt_orphans)"
-orph_keep="$(grep -E "$LEFTOVER_KEEP_RE" <<<"$orphans")"
-if [[ -n "$orph_keep" ]]; then
-  warn "kept, though nothing needs them: $(tr '\n' ' ' <<<"$orph_keep")— data or boot"
-  sub "if you mean it: sudo apt remove <name> (remove, not purge — purge deletes their data)"
-  # Manual from here on: autoremove leaves them alone, now and on later runs.
-  mapfile -t keep_pkgs <<<"$orph_keep"
-  [[ "$SKIP_AUTOREMOVE" == "1" ]] || sudo apt-mark manual "${keep_pkgs[@]}" >/dev/null 2>&1
-  orphans="$(apt_orphans)"
-  left_n=$((left_n+1))
-fi
-orph_show="$(grep -vE "$LEFTOVER_KEEP_RE" <<<"$orphans")"
-if [[ -n "$orph_show" ]]; then
-  sub "unused packages $(list12 "$orph_show")"
-  if [[ "$SKIP_AUTOREMOVE" == "1" ]]; then
-    # No command to copy: by hand, autoremove --purge would take the kept ones too.
-    sub "SKIP_AUTOREMOVE=1 — left in place"
-  elif grep -qE "$LEFTOVER_KEEP_RE" <<<"$orphans"; then
-    # apt-mark did not take: autoremove would purge what we just promised to keep.
-    warn "could not protect the packages above — not running autoremove"; note_fail "autoremove"
+for b in lazygit starship atuin watchexec difft yazi ya trip onefetch jless croc sops \
+         fastfetch procs dive lazydocker sqlcmd; do
+  mine="$HOME/.local/bin/$b"
+  [[ -f "$mine" && ! -L "$mine" ]] || continue
+  sys=""
+  for d in /usr/local/bin /usr/bin /opt/mssql-tools18/bin; do
+    [[ -x "$d/$b" ]] && { sys="$d/$b"; break; }
+  done
+  [[ -n "$sys" ]] || continue
+  if [[ "$b" == sqlcmd ]]; then
+    # go-sqlcmd fallback vs. the real mssql-tools18: different products, versions do not compare.
+    [[ "$sys" == /opt/* ]] || continue
   else
-    soft "apt autoremove" sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -qq \
-      && sub "removed and purged"
+    mv_="$("$mine" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+    sv_="$("$sys"  --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+    [[ -n "$mv_" && -n "$sv_" ]] && dpkg --compare-versions "$sv_" ge "$mv_" || continue
   fi
-  left_n=$((left_n+1))
-fi
-
-residue="$(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 2>/dev/null | awk '$1 == "rc" {print $2}')"
-res_purge="$(grep -E "$LEFTOVER_PURGE_RE" <<<"$residue")"
-res_held="$(grep -vE "$LEFTOVER_PURGE_RE" <<<"$residue")"
-if [[ -n "$res_purge" ]]; then
-  sub "config left by removed kernels / Node packages $(list12 "$res_purge")"
-  if [[ "$SKIP_AUTOREMOVE" == "1" ]]; then
-    sub "SKIP_AUTOREMOVE=1 — left in place"
-  else
-    mapfile -t purge_pkgs <<<"$res_purge"
-    soft "purge leftover config" sudo dpkg --purge "${purge_pkgs[@]}" >/dev/null 2>&1 && sub "purged"
-  fi
-  left_n=$((left_n+1))
-fi
-if [[ -n "$res_held" ]]; then
-  sub "removed earlier, config still on disk $(list12 "$res_held")"
-  sub "not purged for you (purging can delete data): sudo dpkg --purge <name> once you know what it keeps"
-  left_n=$((left_n+1))
-fi
+  rm -f "$mine"; sub "removed ~/.local/bin/$b — $sys is at least as new"; left_n=$((left_n+1))
+done
 (( left_n == 0 )) && sub "nothing left over"
-
-# =============================================================== verify =====
-log "Final apt health check"
-apt_err="$(sudo apt-get update 2>&1 | grep -E '^(E|W):')"
-if [[ -n "$apt_err" ]]; then
-  printf '%s\n' "$apt_err" | sed 's/^/    /'
-  warn "apt reported the above. Re-run with --clean-only to strip our sources."
-  note_fail "apt update"
-else
-  sub "apt update is clean"
-fi
-
 
 # The check that would have caught the silent failure this script now fixes:
 # does a real interactive LOGIN shell actually end up with our config loaded?
@@ -3333,41 +2407,16 @@ else
   note_fail "login-shell wiring"
 fi
 
+
 echo
-log "Installed"
+log "Installed (per user)"
 ver() { printf '    %-16s %s\n' "$1" "${2:--}"; }
-ver git      "$(git --version 2>/dev/null | awk '{print $3}')"
-ver tmux     "$(tmux -V 2>/dev/null | awk '{print $2}')"
-ver node     "$(node --version 2>/dev/null)"
-ver npm      "$(npm --version 2>/dev/null)"
-ver python3  "$(python3 --version 2>/dev/null | awk '{print $2}')"
 ver uv       "$("$HOME/.local/bin/uv" --version 2>/dev/null | awk '{print $2}')"
 ver claude   "$("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}')"
 ver codex    "$("$HOME/.local/bin/codex" --version 2>/dev/null | awk '{print $NF}')"
-ver dotnet   "$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | tail -1)"
-ver psql     "$(psql --version 2>/dev/null | awk '{print $3}')"
-# sqlcmd is either the mssql-tools18 build or the go-sqlcmd fallback binary.
-sqlcmd_ver="$(/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | awk '/Version/{print $2; exit}')"
-[[ -z "$sqlcmd_ver" && -x "$HOME/.local/bin/sqlcmd" ]] && \
-  sqlcmd_ver="$("$HOME/.local/bin/sqlcmd" --version 2>/dev/null | awk '{print $NF; exit}') (go-sqlcmd)"
-ver sqlcmd   "$sqlcmd_ver"
-ver nano     "$(nano --version 2>/dev/null | head -1 | awk '{print $NF}')"
-ver micro    "$(micro -version 2>/dev/null | awk -F': ' '/Version/{print $2}')"
-ver eza      "$(eza --version 2>/dev/null | awk '/^v/{print $1; exit}')"
-ver delta    "$(delta --version 2>/dev/null | awk '{print $2}')"
-ver rg       "$(rg --version 2>/dev/null | awk 'NR==1{print $2}')"
-ver fzf      "$(fzf --version 2>/dev/null | awk '{print $1}')"
-ver gh       "$(gh --version 2>/dev/null | awk 'NR==1{print $3}')"
-ver nvim     "$(nvim --version 2>/dev/null | awk 'NR==1{print $2}')"
-ver docker   "$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)"
-ver lazygit  "$(lazygit --version 2>/dev/null | grep -oE 'version=[^,]+' | cut -d= -f2)"
-ver starship "$(starship --version 2>/dev/null | awk 'NR==1{print $2}')"
-ver atuin    "$(atuin --version 2>/dev/null | awk '{print $2}')"
 ver mise     "$(mise --version 2>/dev/null | awk '{print $1}')"
-ver watchexec "$(watchexec --version 2>/dev/null | awk '{print $2}')"
-ver yazi     "$(yazi --version 2>/dev/null | awk '{print $2}')"
-ver ufw      "$(sudo ufw status 2>/dev/null | awk '/^Status/{print tolower($2)}')"
-
+ver dotnet   "$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | tail -1)"
+ver pnpm     "$(pnpm --version 2>/dev/null)"
 if (( ${#ADOPTED[@]} )); then
   echo
   log "Config that was already here"
@@ -3394,4 +2443,3 @@ sub "Ctrl-R                       # atuin history search (fzf keeps Ctrl-T, Alt-
 sub "DEV_START_DIR=/path bash $0  # change where logins start"
 sub "\$EDITOR ~/.config/dev-bootstrap/local.sh   # your own aliases, never overwritten"
 sub "ls ~/.*.pre-bootstrap        # the config you had before the first run"
-sub "bash $0 --clean-only         # remove this script's apt sources"
