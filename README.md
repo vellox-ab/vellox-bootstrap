@@ -22,7 +22,7 @@ the scripts.
 ## Usage
 
 ```bash
-sudo bash dev-bootstrap-system.sh                 # the machine (asks nothing)
+sudo bash dev-bootstrap-system.sh                 # the machine (asks the firewall questions)
 sudo bash dev-bootstrap-system.sh --clean-only    # only remove the apt artifacts we created
 bash dev-bootstrap-user.sh                        # you (asks identity, start folder, agent)
 bash dev-bootstrap-system.sh --help               # either script
@@ -62,7 +62,10 @@ DEV_ROOT=/srv/dev DEV_EDITOR=micro bash dev-bootstrap-user.sh
 | `NODE_MAJOR` | system | `lts` | `lts` (newest LTS), `current` (newest major) or a major number |
 | `DOTNET_MAJOR` | system | empty | Pin an SDK major; empty takes the newest the distro has |
 | `PG_MAJOR` | system | empty | Pin a PGDG client major; empty takes the newest |
-| `DEV_UFW_TRUST` | system | empty | Networks ufw allows on every port and fail2ban never bans |
+| `DEV_FW_WORK` | system | asked for | Networks you work from (LAN, VPN): they get SSH and mosh |
+| `DEV_FW_WORK_PORTS` | system | asked for | Other ports those networks may reach, e.g. `3000:3199 4000:4199` |
+| `DEV_FW_PROXY` / `DEV_FW_PROXY_PORTS` | system | asked for | A reverse proxy and the web ports it may reach (default: the web ports in `/srv/ports.tsv`) |
+| `DEV_FW_OTHER` | system | asked for | Other hosts as `address=ports`, e.g. `10.4.20.10=22,6160,6162` |
 | `DEV_EXTRAS_UPGRADE` | both | `0` | `1` re-downloads the GitHub-release tools (system) and mise / bash-preexec (user) |
 | `DEV_ROOT` | user | `/srv/dev` | Shared development folder |
 | `DEV_GROUP` | user | `devgroup` | Group that owns `DEV_ROOT` (you are warned if not in it) |
@@ -86,6 +89,50 @@ Skip flags — set any of them to `1`:
   `SKIP_CLAUDE`, `SKIP_CODEX`, `SKIP_CLAUDE_CONF`, `SKIP_TMUX_CONF`,
   `SKIP_SHELL_CONF`, `SKIP_EDITOR_CONF`, `SKIP_GIT_CONF`, `SKIP_GIT_IDENTITY`,
   `SKIP_INPUTRC`, `SKIP_LEGACY_CLEAN`, `SKIP_START_DIR`
+
+### Firewall
+
+The system script asks first, before the installs, who may reach the machine.
+Nothing is open to everyone; incoming traffic is denied except what you name,
+and outgoing traffic stays open:
+
+```
+==> Firewall
+    1. the networks you work from (LAN, VPN): they get SSH and mosh
+    Work networks  [10.4.21.129]: 10.4.21.0/24 10.4.20.33
+    2. what else those networks may reach (dev servers, apps), e.g. 3000:3199 4000:4199
+    Their ports:   3000:3199 4000:4199
+    3. a reverse proxy in front of this machine, if any (one address)
+    Web proxy:     10.4.20.25
+       the ports it may reach: web ports only, never a database
+    Proxy ports    [3010 3020 ... 4180]:
+    4. other hosts and what they may reach, as address=ports (e.g. 10.4.20.10=22,6160,6162)
+    Other hosts:   10.4.20.10=22,2500:3300,6160,6162,11731
+```
+
+Addresses and networks are space-separated; ports are `22`, `3000:3199` or
+`53/udp` (TCP unless it says `/udp`). Enter keeps the answer in brackets,
+`none` clears it. The first default for the work networks is the address your
+SSH session comes from, and the proxy's default ports are the web ports in
+`/srv/ports.tsv`. If the networks you give leave out the session you are on,
+the script says so and asks before it closes SSH for it.
+
+The answers are kept in `/etc/dev-bootstrap/firewall.conf` and offered as the
+defaults next time, so a re-run is Enter, Enter, Enter. The same rules apply to
+ports Docker publishes (Docker bypasses ufw, so they go in its `DOCKER-USER`
+chain); containers can always reach the host. Every run replaces the rules it
+made, so an answer you drop closes its port; rules you added by hand stay.
+
+Answering up front, or not at all:
+
+```bash
+sudo DEV_FW_WORK="10.4.21.0/24 10.4.20.33" DEV_FW_WORK_PORTS="3000:3199 4000:4199" \
+     DEV_FW_PROXY=10.4.20.25 DEV_FW_OTHER=none bash dev-bootstrap-system.sh
+sudo SKIP_HARDENING=1 bash dev-bootstrap-system.sh   # leave ufw, fail2ban and updates alone
+```
+
+With no terminal the last answers are used; with none at all the firewall is
+left as it is and the summary lists it under "Did not complete".
 
 The three questions below are all asked by the user script.
 
@@ -190,7 +237,7 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   - `difftastic` as `git dft` / `git dlog` / `git dshow`; delta stays the pager
   - `yazi` (`y`, the shell follows it), `jless`, `croc`, `sops`, `onefetch`,
     `fastfetch` (shown once per login, `DEV_FASTFETCH=0` turns it off),
-    `harlequin` (TUI SQL IDE, Postgres + ODBC adapters), `ast-grep`
+    `harlequin` (TUI SQL IDE, Postgres adapter), `ast-grep`
 - **Docker** — `docker-ce` with buildx and the compose plugin from Docker's own
   repo, or Ubuntu's `docker.io` + `docker-compose-v2` while that repo has no
   suite for the release yet; whoever ran `sudo` is added to the `docker` group
@@ -199,13 +246,13 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   script never upgrades it itself, as that restarts every container. Plus
   `lazydocker` (`lzd`) and `dive`.
 - **Hardening** — `unattended-upgrades` for security updates, `fail2ban` on
-  sshd (systemd backend, trusted ranges ignored), and `ufw` with incoming
-  denied by default — SSH (on whatever port sshd really listens on) and mosh
-  open from everywhere, everything open from `DEV_UFW_TRUST` — empty by
-  default, so it is safe on production and any other port is opened on
-  purpose. Trusted ranges an earlier run added are removed when no longer
-  listed. The SSH rule is added *before* the firewall is enabled, and
-  enabling is skipped if that rule failed.
+  sshd (systemd backend, work networks ignored), and `ufw` with incoming
+  denied by default and only what the [firewall questions](#firewall) name
+  opened: SSH (on whatever port sshd really listens on) and mosh from the work
+  networks, the ports you list, a proxy's web ports, other hosts' ports — the
+  same for ports Docker publishes. Nothing is open to everyone. If an SSH rule
+  cannot be added, SSH is opened from everywhere rather than locking you out,
+  and the summary says so.
 - **Node.js** — the newest LTS (or `NODE_MAJOR=current` / a pinned major)
   from NodeSource on both releases, upgraded on every run, plus the latest
   npm globals: `npm`, `pnpm`, `yarn`, `typescript@6`, `tsx`,
@@ -269,12 +316,10 @@ SKIP_CLAUDE=1 / SKIP_CODEX=1                # veto one regardless of the answer
   configs — all Catppuccin Mocha, all written whole and backed up once.
 - **git config** — the identity you are asked for, global defaults, `delta` as
   the pager, `difftastic` as the difftool, `tag.sort=version:refname`.
-- **Microsoft SQL tooling** — `sqlcmd` / `bcp` (`mssql-tools18`) and the
-  `msodbcsql18` ODBC driver. Microsoft publishes no SQL packages for 26.04
-  (resolute), so the script probes their repos live and installs the newest
-  suite that actually has them (25.10 today), pinned so nothing *else* from
-  that suite can leak in. If the repo route fails it installs the checksum-
-  verified `.deb` files straight from the pool, and failing that, go-sqlcmd.
+- **Microsoft SQL tooling** — `sqlcmd` only, as go-sqlcmd (a static binary
+  from GitHub). No Microsoft apt source and no `mssql-tools18` / `msodbcsql18`:
+  those packages broke apt on servers, so every run purges them along with the
+  old `mssql-release` source and key.
 - **PostgreSQL client** — the newest `psql` / `pg_dump` from PGDG, `libpq-dev`,
   plus a `psql` pager setup.
 - **System tuning** — raised inotify limits (file watchers and agentic tooling),
@@ -338,7 +383,7 @@ Everything moved aside is listed again at the end of the run.
   listed but never touched.
 - **Leaves nothing unused behind.** npm globals it no longer installs are
   uninstalled, stale copies in `~/.local/bin` go once the system install (apt,
-  `/usr/local/bin` or mssql-tools18) provides the same version or newer, and the run ends by removing dangling links,
+  `/usr/local/bin`) provides the same version or newer, and the run ends by removing dangling links,
   running `apt autoremove --purge`, and purging what removed kernels and Node
   packages left behind. Database servers, Docker and the bootloader are never
   removed — purging them deletes data or boot config — and other leftovers
@@ -356,4 +401,4 @@ Everything moved aside is listed again at the end of the run.
 
 ## Version
 
-Current version: **6.1.0** (see `VERSION`).
+Current version: **7.0.0** (see `VERSION`).

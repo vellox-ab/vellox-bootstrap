@@ -14,7 +14,7 @@ Script version: **6.1.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 ### 1.1 Run model
 
 - Two scripts. `dev-bootstrap-system.sh` runs **as root** (`sudo bash ...`),
-  once per machine, and asks nothing: everything outside a home directory —
+  once per machine, and asks only the firewall questions (§5.1): everything outside a home directory —
   apt, `/etc`, `/usr/local/bin`, Docker, the firewall. `dev-bootstrap-user.sh`
   runs **as each developer**, never root, and needs no sudo at all:
   everything inside `$HOME`. Run the system one first; the user one stops
@@ -35,7 +35,7 @@ Script version: **6.1.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
   automatic; a GitHub-release copy in `/usr/local/bin` goes once apt packages the
   tool at the same version or newer (a newer copy stays: atuin cannot go back
   a version on a history.db it already migrated), and the user script removes `~/.local/bin` copies (from the old single-script
-  bootstrap, or the go-sqlcmd fallback) once the system provides the same
+  bootstrap) once the system provides the same
   version or newer. The user script removes dangling links in `~/.local/bin`;
   the system one runs
   `apt autoremove --purge`, and purges what removed kernels and Node packages
@@ -78,7 +78,7 @@ Script version: **6.1.0**. Targets Ubuntu 24.04 (noble) and 26.04 (resolute).
 | 18 | editor config | user | `SKIP_EDITOR_CONF` | bat theme, nano, micro, nvim, starship, atuin, lazygit, tealdeer, fastfetch, psql |
 | 19 | rc.sh tail | user | `SKIP_SHELL_CONF` | fastfetch + tmux autostart appended last |
 | 20 | git config | user | `SKIP_GIT_CONF` | global git settings, delta, difftastic |
-| 21 | MS SQL tooling | system | `SKIP_MSSQL` | sqlcmd/bcp/ODBC |
+| 21 | MS SQL tooling | system | `SKIP_MSSQL` | sqlcmd (go-sqlcmd) |
 | 22 | postgres | system | `SKIP_POSTGRES` | newest psql from PGDG |
 | 23 | system tuning | both | `SKIP_SYSCTL` | inotify, nofile, ssh keepalive |
 | 24 | hardening | system | `SKIP_HARDENING` | unattended-upgrades, fail2ban, ufw |
@@ -109,7 +109,10 @@ each script.
 | `CLAUDE_PLUGINS` | `pyright-lsp typescript-lsp csharp-lsp` | Claude Code plugins |
 | `GIT_USER_NAME` / `GIT_USER_EMAIL` | empty | both set = no prompt |
 | `DEV_SSH_PUBKEY` | asked | public key line for `~/.ssh/authorized_keys`; Enter at the prompt skips it |
-| `DEV_UFW_TRUST` | empty | networks ufw allows on every port and fail2ban ignores |
+| `DEV_FW_WORK` | asked | networks you work from: SSH, mosh; fail2ban ignores them |
+| `DEV_FW_WORK_PORTS` | asked | other ports the work networks may reach |
+| `DEV_FW_PROXY` / `DEV_FW_PROXY_PORTS` | asked | a reverse proxy and the web ports it may reach |
+| `DEV_FW_OTHER` | asked | other hosts as `address=ports` |
 | `DEV_EXTRAS_UPGRADE` | `0` | `1` re-downloads every GitHub-release tool |
 
 Runtime knobs that go in `~/.config/dev-bootstrap/local.sh` (read by every
@@ -166,11 +169,12 @@ and deleted on the next run.
 
 | File | Purpose |
 |---|---|
-| `/etc/apt/sources.list.d/{nodesource,pgdg,mssql-release,docker}.sources` | deb822 sources, each with `Signed-By` |
-| `/etc/apt/keyrings/{nodesource,pgdg,microsoft,docker}.asc` | armoured keys |
-| `/etc/apt/preferences.d/mssql-release.pref` | pin: only the two SQL packages may come from a foreign suite |
+| `/etc/apt/sources.list.d/{nodesource,pgdg,docker}.sources` | deb822 sources, each with `Signed-By` |
+| `/etc/apt/keyrings/{nodesource,pgdg,docker}.asc` | armoured keys |
 | `/etc/apt/apt.conf.d/20auto-upgrades` | unattended-upgrades schedule |
 | `/etc/fail2ban/jail.d/dev-bootstrap-sshd.local` | sshd jail |
+| `/etc/dev-bootstrap/firewall.conf` | the firewall answers (root only), defaults for the next run |
+| `/etc/ufw/after.rules`, `after6.rules` | the `# BEGIN/END dev-bootstrap` block: `DOCKER-USER` rules |
 | `/etc/sysctl.d/60-inotify.conf` | inotify limits |
 | `/etc/security/limits.d/90-dev-nofile.conf` | open-file limits |
 
@@ -203,7 +207,7 @@ All carry `managed-by: dev-bootstrap` and the apt ones are removed by
 ### 2.2 PATH
 
 `~/.local/bin` is prepended (npm globals, pipx, uv, claude, every
-GitHub-release binary). Appended when present: `/opt/mssql-tools18/bin`,
+GitHub-release binary). Appended when present:
 `~/.dotnet/tools`, `~/.dotnet` (private SDK only). The helpers
 `__path_prepend/append/dedupe` make re-sourcing safe.
 
@@ -344,7 +348,7 @@ sourcing never *unsets* anything and stale bindings would otherwise survive.
 `DEV_TMUX_RESET=0` disables the reset.
 
 **mosh** is installed; `mosh host` gives an SSH session that survives roaming
-and sleep. It needs UDP 60000–61000, which the ufw section opens.
+and sleep. It needs UDP 60000–61000, which the ufw section opens to the work networks.
 
 ---
 
@@ -528,16 +532,13 @@ refreshes all of them.
   completion, per-database history, shortcuts `:activity :locks :dbsize
   :tablesize :uptime :version`. Pager `pspg`.
 - **pgcli** (`pg`) — autocompleting psql.
-- **harlequin** — TUI SQL IDE (`harlequin -a postgres postgres://…`,
-  `harlequin -a odbc "Driver=…"` for SQL Server via the ODBC driver, or a
-  sqlite file directly). Installed with the postgres adapter plus
-  `harlequin-odbc`.
-- **Microsoft SQL** — `sqlcmd` and `bcp` (`mssql-tools18`) plus the
-  `msodbcsql18` ODBC driver in `/opt/mssql-tools18/bin`. Microsoft publishes
-  no packages for 26.04, so the script probes their repos and installs the
-  newest suite that has them (25.10), pinned so nothing *else* leaks from it;
-  then the pool `.deb`s (checksum-verified); then go-sqlcmd as last resort.
-  EULA pre-accepted. `sqlcmd` is aliased with `-C` (trust dev certificates).
+- **harlequin** — TUI SQL IDE (`harlequin -a postgres postgres://…`, or a
+  sqlite file directly). Installed with the postgres adapter.
+- **Microsoft SQL** — `sqlcmd` is go-sqlcmd, a static binary from GitHub in
+  `/usr/local/bin`. No Microsoft apt source, no `bcp`, no `msodbcsql18` ODBC
+  driver: their packages broke apt on more than one server, so every run purges
+  `mssql-tools18`/`msodbcsql18` and the old `mssql-release` source and key.
+  `sqlcmd` is aliased with `-C` (trust dev certificates).
 - **sqlite3**, **sqlfluff** (SQL linter), **unixodbc**.
 
 ### 4.8 Docker
@@ -554,16 +555,17 @@ refreshes all of them.
 - **lazydocker** (`lzd`) — TUI over containers, images, volumes and compose
   projects. **dive** — `dive image:tag` explores image layers and wasted
   space.
-- Docker writes its own iptables chains and **bypasses ufw**: a port
-  published with `-p` is reachable regardless of the firewall. Bind to
-  `127.0.0.1:port:port` when that matters.
+- Docker writes its own iptables chains and **bypasses ufw**, so the
+  firewall section puts the same answers in Docker's `DOCKER-USER` chain: a
+  published port is reachable only from the sources and ports you named
+  (§5.1). Bind to `127.0.0.1:port:port` for what only the machine needs.
 
 ### 4.9 Sharing a terminal — `tshare`
 
 `tshare user:password [port]` starts `ttyd` serving the `dev` tmux session
 in a browser at `http://<ip>:7681/`, writable, with HTTP basic auth (the
 credentials are mandatory by design — it is a full shell). Reachable from the
-`DEV_UFW_TRUST` networks only, unless you `ufw allow 7681/tcp` yourself. Ctrl-C
+work networks only if 7681 is among their ports (§5.1). Ctrl-C
 stops it.
 
 ### 4.10 Claude Code
@@ -597,27 +599,48 @@ stops it.
 
 ### 5.1 ufw
 
-Installed and enabled with: default **deny incoming, allow outgoing**;
-SSH allowed on **every port sshd actually listens on** (`sshd -T`, default
-22); mosh UDP 60000–61000; and **everything allowed from each network in
-`DEV_UFW_TRUST`** — empty by default, so the script is production-safe and
-every other port is opened on purpose, e.g. for the reverse proxy:
-`sudo ufw allow from 10.4.20.25 to any port 4010 proto tcp`. To trust a
-LAN/VPN on a dev box: `sudo DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap-system.sh`.
-Ranges an earlier run trusted (older versions trusted all of RFC 1918) are
-deleted on the next run if `DEV_UFW_TRUST` no longer lists them; rules you
-added yourself are never touched.
+Default **deny incoming, allow outgoing**, and nothing open to everyone. The
+script asks, before the installs (README, "Firewall"):
 
-Safety: the SSH rule is added *before* `ufw --force enable`, and enabling is
-skipped if it failed. An already-active ufw only gets the rules refreshed
-(`ufw allow` is idempotent). `sudo ufw status numbered` to inspect, `sudo ufw
-delete <n>` to remove, `sudo ufw disable` to turn off.
+1. **Work networks** — where you work from (LAN, VPN). They get SSH, on every
+   port sshd listens on (`sshd -T`), and mosh (UDP 60000–61000).
+2. **Their ports** — what else they may reach, e.g. `3000:3199 4000:4199`.
+3. **Web proxy** — one reverse proxy, and the ports it may reach: web ports
+   only, never a database. Default: the web ports in `/srv/ports.tsv`
+   (`PORTS_FILE`): service `web`, or a public hostname in the note.
+4. **Other hosts** — `address=ports`, e.g. a backup server
+   `10.4.20.10=22,2500:3300,6160,6162,11731`.
+
+Ports are TCP unless written `53/udp`. `DEV_FW_*` answer up front; `none` is
+an empty answer. The answers go to `/etc/dev-bootstrap/firewall.conf` (root
+only) and are the defaults next time; a run without a terminal reuses them, and
+with none at all ufw is left as it is (listed under "Did not complete").
+
+Every rule the script makes has the comment `dev-bootstrap <role>`. Each run
+removes those (and what older versions made: `ssh`, `mosh`, `trusted
+(dev-bootstrap)`, and the 2026-11 srv10 lockdown's `vellox dev+prod`, `nginx
+proxy (web)`, `veeam`) and adds the answers again, so a dropped answer closes
+its port. Rules with any other comment, or none, are never touched.
+
+**Docker** publishes ports past ufw. The same answers go in Docker's
+`DOCKER-USER` chain, in the `# BEGIN/END dev-bootstrap` block of
+`/etc/ufw/after.rules` (`after6.rules` for IPv6 sources), matched on the
+published host port (`--ctorigdstport`): established traffic and traffic from
+the Docker bridges pass, the named sources reach their named ports, the rest
+is dropped. Containers may always reach the host itself.
+
+Safety: if the session you run the script from is outside the work networks,
+it says so and asks before closing SSH for it (with `DEV_FW_WORK` set it
+refuses instead). Between removing and re-adding the rules there are a few
+seconds without an SSH rule — open sessions survive, new ones wait. If an SSH
+rule cannot be added, SSH is opened from everywhere (`dev-bootstrap ssh
+fallback`) and the summary lists ufw. `sudo ufw status numbered` to inspect.
 
 ### 5.2 fail2ban
 
 `/etc/fail2ban/jail.d/dev-bootstrap-sshd.local`: sshd jail, `backend =
 systemd` (Ubuntu has no `/var/log/auth.log` without rsyslog), 5 failures in
-10 minutes → 1 hour ban, `ignoreip` = localhost + `DEV_UFW_TRUST`, so a typo
+10 minutes → 1 hour ban, `ignoreip` = localhost + the work networks, so a typo
 from your own network never bans you. `sudo fail2ban-client status sshd`,
 `sudo fail2ban-client set sshd unbanip <ip>`.
 
@@ -677,8 +700,8 @@ Base `#1e1e2e`, text `#cdd6f4`, blue `#89b4fa`, mauve `#cba6f7`, green
 | Mouse drag highlights sometimes, not others | the program in the pane (nano, Claude Code, vim…) has the mouse; Shift+drag. Stuck even at a prompt: `mousefix` — see §3 |
 | tmux keeps old bindings | the server predates the config; `tmux kill-server` or re-run (`DEV_TMUX_RESET=1`) |
 | `docker: permission denied` | group membership needs a new login (`newgrp docker`) |
-| A published container port is reachable despite ufw | Docker bypasses ufw by design; bind to `127.0.0.1` |
-| Locked out of SSH by fail2ban | from a trusted network it cannot happen (`ignoreip`); otherwise `fail2ban-client set sshd unbanip <ip>` from the console |
+| A published container port is not reachable | its port is not in the answers for that source; re-run and add it (§5.1) |
+| Locked out of SSH | from a work network fail2ban never bans (`ignoreip`); from elsewhere SSH is closed by design — use the console, `sudo ufw allow from <ip> to any port 22 proto tcp`, then re-run with that network |
 | `tldr` says cache is missing | `tldr --update` (needs network) |
 | `trip` asks for root | `sudo setcap cap_net_raw+ep $(command -v trip)` |
 | GitHub-release tool missing after a run | anonymous API limit (60/h) hit — `sudo gh auth login` (the system script runs as root) or wait, then re-run; the summary lists it under "Did not complete" |

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # HELP>
-# dev-bootstrap-system.sh (v6) — the server half of the Ubuntu dev bootstrap
+# dev-bootstrap-system.sh (v7) — the server half of the Ubuntu dev bootstrap
 #
 # Run ONCE per machine, as root. Then every developer runs
 # dev-bootstrap-user.sh as themselves (no sudo needed for that one).
@@ -24,12 +24,14 @@
 # What it does: apt packages, Node (NodeSource), .NET SDK, the PostgreSQL and
 # SQL Server clients, Docker, extra tools from GitHub releases (installed to
 # /usr/local/bin for every user), inotify / open-file limits, and a light
-# hardening pass (unattended-upgrades, fail2ban, ufw). The firewall opens SSH
-# (and mosh) only; set DEV_UFW_TRUST to networks that should reach every port
-# (none by default — production-safe).
+# hardening pass (unattended-upgrades, fail2ban, ufw). The firewall opens
+# nothing to everyone: it asks which networks you work from (SSH, mosh and the
+# ports you name), a web proxy and its web ports, and any other host with its
+# ports, and applies that to Docker-published ports too.
 #
 #   sudo SKIP_EXTRAS=1 SKIP_DOCKER=1 SKIP_HARDENING=1 bash dev-bootstrap-system.sh
-#   sudo DEV_UFW_TRUST="10.8.0.0/24" bash dev-bootstrap-system.sh
+#   sudo DEV_FW_WORK="10.4.21.0/24 10.4.20.33" DEV_FW_WORK_PORTS="3000:3199 4000:4199" \
+#        DEV_FW_PROXY=10.4.20.25 DEV_FW_OTHER="10.4.20.10=22,6160,6162" bash dev-bootstrap-system.sh
 #
 # It ends by removing what nothing uses any more — unused packages and config
 # left by removed kernels and Node packages. Database servers, Docker and the
@@ -37,7 +39,9 @@
 #
 #   sudo SKIP_AUTOREMOVE=1 bash dev-bootstrap-system.sh    # list leftover packages only
 #
-# It asks nothing, so it runs unattended.
+# It asks the firewall questions first, then runs unattended. DEV_FW_* answer
+# them up front ("none" = empty); without a terminal the last answers are
+# reused, and with none at all the firewall is left as it is.
 #
 # Deliberately NOT using `set -e`: a single failing repo must never leave the
 # machine half-configured. Failures are collected and reported at the end.
@@ -60,10 +64,14 @@ SKIP_HARDENING="${SKIP_HARDENING:-0}"   # unattended-upgrades, fail2ban, ufw
 SKIP_AUTOREMOVE="${SKIP_AUTOREMOVE:-0}" # 1 = list leftover packages, remove none
 SKIP_SYSCTL="${SKIP_SYSCTL:-0}"
 DEV_EXTRAS_UPGRADE="${DEV_EXTRAS_UPGRADE:-0}"   # 1 = re-download release tools
-# Networks the firewall and fail2ban trust outright (every port open to them).
-# Empty by default so the script is safe on production; SSH is allowed from
-# everywhere regardless, so an empty list cannot lock you out.
-DEV_UFW_TRUST="${DEV_UFW_TRUST:-}"
+# Firewall answers (see "firewall questions" below). Setting one answers its
+# question up front and skips it; "none" means an empty answer.
+DEV_FW_WORK="${DEV_FW_WORK:-}"                 # networks you work from: SSH + mosh
+DEV_FW_WORK_PORTS="${DEV_FW_WORK_PORTS:-}"     # ports they may reach besides SSH and mosh
+DEV_FW_PROXY="${DEV_FW_PROXY:-}"               # a reverse proxy in front of the machine
+DEV_FW_PROXY_PORTS="${DEV_FW_PROXY_PORTS:-}"   # the (web) ports the proxy may reach
+DEV_FW_OTHER="${DEV_FW_OTHER:-}"               # other hosts: "addr=ports addr=ports"
+PORTS_FILE="${PORTS_FILE:-/srv/ports.tsv}"     # port registry; its web ports are the proxy default
 CLEAN_ONLY=0
 
 MANAGED="# managed-by: dev-bootstrap -- safe to delete, regenerated on re-run"
@@ -109,6 +117,22 @@ soft() {                       # soft <label> <command...>
 }
 note_fail() { FAILED_STEPS+=("$1"); }
 
+# Same prompt as dev-bootstrap-user.sh (the two scripts are fetched separately).
+# Reads /dev/tty so it works under `curl ... | sudo bash`.
+ask_tty() {                    # ask_tty <varname> <question> <default>
+  local __name="$1" question="$2" default="$3" reply=""
+  if [[ -n "$default" ]]; then
+    printf '    %-14s [%s]: ' "$question" "$default" >/dev/tty
+  else
+    printf '    %-14s ' "$question:" >/dev/tty
+  fi
+  IFS= read -r reply </dev/tty || reply=""
+  reply="${reply#"${reply%%[![:space:]]*}"}"    # trim leading whitespace
+  reply="${reply%"${reply##*[![:space:]]}"}"    # trim trailing whitespace
+  [[ -z "$reply" ]] && reply="$default"
+  printf -v "$__name" '%s' "$reply"
+}
+
 apt_has()  { apt-cache show "$1" >/dev/null 2>&1; }
 apt_cand() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2}'; }
 # Not `apt-cache policy | grep -q`: grep -q quits at the match, apt-cache dies
@@ -147,6 +171,193 @@ esac
 
 
 install -d -m 0755 "$BIN"
+
+# ===================================================== firewall questions ===
+# Nothing is reachable from everywhere. You name who may reach what, and the
+# hardening section turns that into ufw rules, plus the same rules for ports
+# Docker publishes (Docker bypasses ufw, so they go in its DOCKER-USER chain):
+#   work networks   where you work from (LAN, VPN): SSH and mosh
+#   their ports     what else they may reach, e.g. dev servers 3000:3199
+#   web proxy       one reverse proxy, and the web ports it may reach (never a
+#                   database): default the web ports in $PORTS_FILE
+#   other hosts     anything else, as address=ports (a backup server, say)
+# Asked here rather than in the hardening section: twenty minutes of installs
+# come in between, and a question nobody is there to answer blocks the run.
+# DEV_FW_* answer a question up front and skip it. Answers are kept in
+# FW_STATE and offered as the defaults next time; a run without a terminal
+# reuses them, and with no answers at all the firewall is left as it is.
+FW_STATE=/etc/dev-bootstrap/firewall.conf
+FW_READY=0
+FW_SESSION_IP=""
+
+fw_nets_ok() {                 # fw_nets_ok "<addr|cidr> ..." (empty = ok)
+  python3 -c 'import ipaddress,sys
+for a in sys.argv[1].split(): ipaddress.ip_network(a, strict=False)' "$1" 2>/dev/null
+}
+fw_ports_ok() {                # fw_ports_ok "22 3000:3199,53/udp" (empty = ok)
+  local i lo hi
+  for i in ${1//,/ }; do
+    [[ "$i" =~ ^([0-9]{1,5})(:([0-9]{1,5}))?(/(tcp|udp))?$ ]] || return 1
+    lo=$((10#${BASH_REMATCH[1]})); hi=$((10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}))
+    (( lo >= 1 && hi <= 65535 && lo <= hi )) || return 1
+  done
+}
+fw_work_ok()  { [[ -n "$1" ]] && fw_nets_ok "$1"; }
+fw_proxy_ok() { [[ -z "$1" ]] || { [[ "$1" != *" "* ]] && fw_nets_ok "$1"; }; }
+fw_other_ok() {                # fw_other_ok "addr=ports addr=ports" (empty = ok)
+  local e
+  for e in $1; do
+    [[ "$e" == ?*=?* ]] && fw_nets_ok "${e%%=*}" && fw_ports_ok "${e#*=}" || return 1
+  done
+}
+fw_covers() {                  # fw_covers <ip> "<nets>": is ip inside one of them?
+  python3 -c 'import ipaddress,sys
+ip = ipaddress.ip_address(sys.argv[1])
+sys.exit(0 if any(ip in ipaddress.ip_network(n, strict=False) for n in sys.argv[2].split()) else 1)' \
+    "$1" "$2" 2>/dev/null
+}
+# The rule plan, one line per ufw rule: <source> <proto> <port,port,...> <role>.
+# At most 7 entries a line: ufw takes 15 ports per rule and a range counts 2.
+fw_emit() {                    # fw_emit <source> <ports> <role>
+  local src="$1" role="$3" proto i items chunk
+  for proto in tcp udp; do
+    items=()
+    for i in ${2//,/ }; do
+      if [[ "$i" == */udp ]]; then [[ $proto == udp ]] && items+=("${i%/udp}")
+      else [[ $proto == tcp ]] && items+=("${i%/tcp}"); fi
+    done
+    while (( ${#items[@]} )); do
+      chunk=("${items[@]:0:7}"); items=("${items[@]:7}")
+      printf '%s %s %s %s\n' "$src" "$proto" "$(IFS=,; echo "${chunk[*]}")" "$role"
+    done
+  done
+}
+fw_plan() {                    # fw_plan <ssh ports, space-separated> <mosh 0|1>
+  local n e
+  for n in $FW_WORK; do
+    fw_emit "$n" "$1" ssh
+    [[ "$2" == 1 ]] && fw_emit "$n" 60000:61000/udp mosh
+    [[ -n "$FW_WORK_PORTS" ]] && fw_emit "$n" "$FW_WORK_PORTS" work
+  done
+  [[ -n "$FW_PROXY" && -n "$FW_PROXY_PORTS" ]] && fw_emit "$FW_PROXY" "$FW_PROXY_PORTS" proxy
+  for e in $FW_OTHER; do fw_emit "${e%%=*}" "${e#*=}" other; done
+}
+# Containers reach the host; Docker-published ports take the plan's sources and
+# ports only. ctorigdstport is the published host port (after DNAT the packet's
+# own port is the container's). IPv4 and IPv6 sources go to their own file.
+fw_docker_block() {            # fw_docker_block <4|6> <plan>
+  local pre=ufw src proto ports role p
+  [[ "$1" == 6 ]] && pre=ufw6
+  echo '# BEGIN dev-bootstrap'
+  echo '*filter'
+  echo ':DOCKER-USER - [0:0]'
+  echo "-A ${pre}-after-input -i docker0 -j ACCEPT"
+  echo "-A ${pre}-after-input -i br-+ -j ACCEPT"
+  echo '-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN'
+  echo '-A DOCKER-USER -i docker0 -j RETURN'
+  echo '-A DOCKER-USER -i br-+ -j RETURN'
+  while read -r src proto ports role; do
+    [[ -z "$src" ]] && continue
+    if [[ "$src" == *:* ]]; then [[ "$1" == 6 ]] || continue; else [[ "$1" == 4 ]] || continue; fi
+    for p in ${ports//,/ }; do
+      echo "-A DOCKER-USER -s $src -p $proto -m conntrack --ctorigdstport $p -j RETURN"
+    done
+  done <<<"$2"
+  echo '-A DOCKER-USER -j DROP'
+  echo 'COMMIT'
+  echo '# END dev-bootstrap'
+}
+fw_web_ports() {               # web ports in the registry: service "web", or a public hostname
+  [[ -r "$PORTS_FILE" ]] || return 0
+  awk -F'\t' '!/^#/ && ($3=="dev"||$3=="prod") && ($4=="web" || $5 ~ /[a-z0-9]\.vellox\.(se|one)/) {print $1}' \
+    "$PORTS_FILE" | sort -n | tr '\n' ' ' | sed 's/ $//'
+}
+fw_ask() {                     # fw_ask <var> <label> <default> <check>: re-asks until valid
+  local __v="$1" ans
+  while :; do
+    ask_tty ans "$2" "$3"
+    [[ "$ans" == none ]] && ans=""
+    "$4" "$ans" && break
+    warn "not understood — use the form in the example, or 'none'"
+  done
+  printf -v "$__v" '%s' "$ans"
+}
+
+if [[ "$SKIP_HARDENING" != "1" && "$CLEAN_ONLY" != "1" ]]; then
+  [[ -n "${DEV_UFW_TRUST:-}" ]] && \
+    warn "DEV_UFW_TRUST is gone (v7, it opened every port): use DEV_FW_WORK and DEV_FW_WORK_PORTS"
+  FW_WORK=""; FW_WORK_PORTS=""; FW_PROXY=""; FW_PROXY_PORTS=""; FW_OTHER=""
+  # shellcheck disable=SC1090
+  [[ -r "$FW_STATE" ]] && . "$FW_STATE"
+  fw_yes=""                    # "y" once you agreed to close SSH from this session
+  # A DEV_FW_* value answers its question; "none" is an empty answer.
+  fw_env=()
+  for v in WORK WORK_PORTS PROXY PROXY_PORTS OTHER; do
+    e="DEV_FW_$v"
+    if [[ -n "${!e}" ]]; then
+      [[ "${!e}" == none ]] && printf -v "FW_$v" '%s' "" || printf -v "FW_$v" '%s' "${!e}"
+      fw_env+=("$v")
+    fi
+  done
+  fw_from_env() { [[ " ${fw_env[*]} " == *" $1 "* ]]; }
+  # The address this session comes from: never cut it off without asking.
+  have_tty=0; (exec </dev/tty) 2>/dev/null && have_tty=1
+  (( have_tty )) && FW_SESSION_IP="$(who -m </dev/tty 2>/dev/null | sed -nE 's/.*\(([0-9a-fA-F.:]+)\)$/\1/p')"
+  fw_valid() { fw_work_ok "$FW_WORK" && fw_ports_ok "$FW_WORK_PORTS" && fw_proxy_ok "$FW_PROXY" \
+               && fw_ports_ok "$FW_PROXY_PORTS" && fw_other_ok "$FW_OTHER"; }
+
+  if (( have_tty )) && (( ${#fw_env[@]} < 5 )); then
+    log "Firewall"
+    sub "incoming traffic is denied except what you list here; outgoing stays open"
+    sub "addresses or networks space-separated (10.4.21.0/24 10.4.20.33); ports like 22 3000:3199 53/udp"
+    sub "Enter keeps the answer in [brackets], 'none' clears it"
+    if ! fw_from_env WORK; then
+      sub "1. the networks you work from (LAN, VPN): they get SSH and mosh"
+      while :; do
+        fw_ask FW_WORK "Work networks" "${FW_WORK:-$FW_SESSION_IP}" fw_work_ok
+        [[ -z "$FW_SESSION_IP" ]] || fw_covers "$FW_SESSION_IP" "$FW_WORK" && break
+        warn "this session comes from ${FW_SESSION_IP}, which is not in them: SSH from it will be closed"
+        ask_tty fw_yes "Close it? [y/N]" ""
+        [[ "$fw_yes" == [yY]* ]] && break
+      done
+    fi
+    if ! fw_from_env WORK_PORTS; then
+      sub "2. what else those networks may reach (dev servers, apps), e.g. 3000:3199 4000:4199"
+      fw_ask FW_WORK_PORTS "Their ports" "$FW_WORK_PORTS" fw_ports_ok
+    fi
+    if ! fw_from_env PROXY; then
+      sub "3. a reverse proxy in front of this machine, if any (one address)"
+      fw_ask FW_PROXY "Web proxy" "$FW_PROXY" fw_proxy_ok
+    fi
+    if [[ -n "$FW_PROXY" ]] && ! fw_from_env PROXY_PORTS; then
+      sub "   the ports it may reach: web ports only, never a database"
+      [[ -z "$FW_PROXY_PORTS" ]] && FW_PROXY_PORTS="$(fw_web_ports)" \
+        && [[ -n "$FW_PROXY_PORTS" ]] && sub "   (offered: the web ports in ${PORTS_FILE})"
+      fw_ask FW_PROXY_PORTS "Proxy ports" "$FW_PROXY_PORTS" fw_ports_ok
+    fi
+    if ! fw_from_env OTHER; then
+      sub "4. other hosts and what they may reach, as address=ports (e.g. 10.4.20.10=22,6160,6162)"
+      fw_ask FW_OTHER "Other hosts" "$FW_OTHER" fw_other_ok
+    fi
+  fi
+  [[ -z "$FW_PROXY" ]] && FW_PROXY_PORTS=""
+
+  if [[ -z "$FW_WORK" ]]; then
+    warn "firewall: no work networks (no terminal, no DEV_FW_WORK, no earlier answers) — ufw is left as it is"
+  elif ! fw_valid; then
+    warn "firewall: the DEV_FW_* answers do not parse — ufw is left as it is"
+  elif [[ -n "$FW_SESSION_IP" && "$fw_yes" != [yY]* ]] && ! fw_covers "$FW_SESSION_IP" "$FW_WORK"; then
+    warn "firewall: ${FW_SESSION_IP} (this session) is not in DEV_FW_WORK — ufw is left as it is"
+  else
+    FW_READY=1
+    install -d -m 0700 /etc/dev-bootstrap
+    { echo "$MANAGED"
+      for v in FW_WORK FW_WORK_PORTS FW_PROXY FW_PROXY_PORTS FW_OTHER; do printf '%s=%q\n' "$v" "${!v}"; done
+    } > "$FW_STATE"
+    chmod 0600 "$FW_STATE"
+    sub "firewall: work ${FW_WORK} | their ports ${FW_WORK_PORTS:-none} | proxy ${FW_PROXY:-none}${FW_PROXY:+ (${FW_PROXY_PORTS:-no ports})} | other ${FW_OTHER:-none}"
+  fi
+fi
 
 # =============================================================== cleanup ====
 # Remove every apt artifact this script family has ever created, in any format,
@@ -197,10 +408,23 @@ done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -
          | grep -v 'ubuntu\.sources' | sort)
 (( foreign == 0 )) && sub "(none)"
 
+# Microsoft's SQL packages from earlier runs go, in whatever state dpkg holds
+# them: a half-installed msodbcsql18 blocks every apt-get after this point.
+# Not tied to SKIP_MSSQL — this is about apt working, not about sqlcmd.
+ms_pkgs=()
+for p in mssql-tools18 msodbcsql18; do dpkg -s "$p" >/dev/null 2>&1 && ms_pkgs+=("$p"); done
+if (( ${#ms_pkgs[@]} )); then
+  log "Purging Microsoft's SQL packages (${ms_pkgs[*]}) — go-sqlcmd replaces them"
+  env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${ms_pkgs[@]}" >/dev/null 2>&1 \
+    || dpkg --purge --force-remove-reinstreq "${ms_pkgs[@]}" >/dev/null 2>&1 \
+    || { warn "could not purge ${ms_pkgs[*]} — try: sudo dpkg --purge --force-all ${ms_pkgs[*]}"
+         note_fail "purge ${ms_pkgs[*]}"; }
+fi
+
 if [[ "$CLEAN_ONLY" == "1" ]]; then
   log "Refreshing apt after cleanup"
   apt-get update 2>&1 | grep -E '^(E|W):' | sed 's/^/    /'
-  log "--clean-only finished. No packages or config were changed."
+  log "--clean-only finished. No other packages or config were changed."
   exit 0
 fi
 
@@ -564,233 +788,13 @@ if [[ "$SKIP_DOCKER" != "1" ]]; then
 fi
 
 # ================================================== microsoft sql tooling ===
-# What the Microsoft repos actually carry is probed live below; as of this
-# writing:
-#   ubuntu/24.04/prod (noble)     -> msodbcsql18 + mssql-tools18, plus ~100
-#                                    unrelated packages (powershell, moby, ...)
-#   ubuntu/25.10/prod (questing)  -> msodbcsql18 + mssql-tools18 and nothing else
-#   ubuntu/26.04/prod (resolute)  -> exists and signs, but carries only the
-#                                    container/Azure packages — no SQL tooling
-# So on 26.04 we install packages built for an older release. They run fine:
-# both depend on nothing but libc6, libstdc++6, libkrb5-3, openssl and debconf.
-#
-# Three routes are tried in order, because the repo route has many moving parts
-# (keys, suites, Signed-By conflicts, pinning) and any of them can already be
-# broken on a machine that has met another Microsoft installer:
-#   1. a Microsoft repo that is already configured here and already offers it
-#   2. our own source for the newest suite that really carries the packages
-#   3. the .deb files straight from the pool, checksum-verified and installed
-#      with `apt-get install ./file.deb`, so apt still resolves dependencies
-#      but nothing depends on repo metadata, signing keys or pinning
-# If all three fail, go-sqlcmd (a static binary: sqlcmd, but no bcp, no driver).
-MS_BIN=/opt/mssql-tools18/bin
-
-# Both packages gate their *preinst* on a debconf answer, and a preinst that
-# refuses aborts the whole apt transaction. ACCEPT_EULA in the environment is
-# Microsoft's documented way in, and every install below sets it with `env`
-# so it reaches the maintainer script. Seeding the answers as well covers the case where the config
-# script never runs (a plain `dpkg -i`, or a package configured out of band).
-ms_eula_preseed() {
-  have debconf-set-selections || return 0
-  printf '%s\n' \
-    'msodbcsql18 msodbcsql/ACCEPT_EULA boolean true' \
-    'msodbcsql18 msodbcsql/accept_eula boolean true' \
-    'mssql-tools18 mssql-tools/accept_eula boolean true' \
-    | debconf-set-selections 2>/dev/null
-}
-
-# ms_apt_install <target...> — targets are package names or local .deb paths.
-# Only mssql-tools18 is ever named: msodbcsql18 comes along as its dependency
-# when it is missing and is left alone when it is already installed. Asking for
-# msodbcsql18 by name would make apt reinstall it, and its preinst aborts the
-# transaction with "ODBC Driver 18 for SQL Server detected!" when the driver is
-# already registered with odbcinst.
-ms_apt_install() {
-  env ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y -qq "$@"
-}
-
-# ms_newest <packages-index> <package> -> "version<TAB>filename<TAB>sha256"
-# The pool indexes keep every version ever published, in no useful order, so
-# the winner is picked with dpkg's own version comparison rather than sort.
-ms_newest() {
-  local idx="$1" want="$2" best="" bestline="" v f s
-  while IFS=$'\t' read -r v f s; do
-    [[ -z "$v" || -z "$f" || -z "$s" ]] && continue
-    if [[ -z "$best" ]] || dpkg --compare-versions "$v" gt "$best"; then
-      best="$v"; bestline="${v}"$'\t'"${f}"$'\t'"${s}"
-    fi
-  done < <(awk -v want="$want" '
-      function flush() {
-        if (p == want && v != "" && f != "" && s != "") print v "\t" f "\t" s
-        p=""; v=""; f=""; s=""
-      }
-      /^Package: /  { flush(); p=$2 }
-      /^Version: /  { if (p==want) v=$2 }
-      /^Filename: / { if (p==want) f=$2 }
-      /^SHA256: /   { if (p==want) s=$2 }
-      END           { flush() }
-    ' "$idx")
-  [[ -n "$bestline" ]] || return 1
-  printf '%s\n' "$bestline"
-}
-
-# ms_pool_install <base-url> <packages-index>
-ms_pool_install() {
-  local base="$1" idx="$2" tmpd pkg line ver file sha rc=0
-  tmpd="$(mktemp -d)" || return 1
-  local debs=()
-  for pkg in msodbcsql18 mssql-tools18; do
-    # Skip the driver when it is already installed — see ms_apt_install.
-    [[ "$pkg" == msodbcsql18 ]] && pkg_installed msodbcsql18 && continue
-    if ! line="$(ms_newest "$idx" "$pkg")"; then
-      warn "${pkg} is not in the pool index"; rc=1; break
-    fi
-    IFS=$'\t' read -r ver file sha <<<"$line"
-    sub "downloading ${pkg} ${ver}"
-    if ! curl -fsSL --max-time 300 -o "${tmpd}/${pkg}.deb" "${base}/${file}"; then
-      warn "download failed: ${base}/${file}"; rc=1; break
-    fi
-    if ! printf '%s  %s\n' "$sha" "${tmpd}/${pkg}.deb" | sha256sum -c --status; then
-      warn "checksum mismatch for ${pkg} ${ver} — refusing to install it"; rc=1; break
-    fi
-    debs+=("${tmpd}/${pkg}.deb")
-  done
-  if (( rc == 0 )) && (( ${#debs[@]} )); then
-    ms_apt_install "${debs[@]}" || rc=1
-  fi
-  rm -rf "$tmpd"
-  return "$rc"
-}
-
+# sqlcmd is go-sqlcmd: one static binary from GitHub, nothing in apt. Microsoft's
+# apt packages (mssql-tools18, msodbcsql18) are not used any more: their repo has
+# no SQL packages for some Ubuntu releases, and msodbcsql18's maintainer scripts
+# can abort every apt transaction on the machine. The cleanup purges old copies.
 if [[ "$SKIP_MSSQL" != "1" ]]; then
-  # An installed copy still goes through the probe and route 2: the cleanup
-  # above removed its source, and route 2 is what puts it back so apt keeps it
-  # patched. Route 3 and go-sqlcmd are only for a missing sqlcmd.
-  ms_done=0; ms_have=0
-  if [[ -x "$MS_BIN/sqlcmd" ]]; then
-    log "sqlcmd already installed — putting its apt source back"
-    sub "$MS_BIN/sqlcmd  ($(dpkg-query -W -f='${Version}' mssql-tools18 2>/dev/null || echo 'not from a package'))"
-    ms_have=1
-  else
-    log "Installing the Microsoft SQL tooling"
-  fi
-  ms_eula_preseed
-
-  # ---- route 1: a Microsoft repo that is already configured here ----------
-  # Not for an installed copy: apt offers that as its own candidate even with
-  # no source behind it, which would pass for "reachable" here.
-  if (( ! ms_have )) && apt_installable mssql-tools18; then
-    sub "already reachable from a configured repo (candidate $(apt_cand mssql-tools18))"
-    ms_apt_install mssql-tools18 && ms_done=1
-    (( ms_done )) || warn "that repo could not deliver the package — trying the other routes"
-  fi
-
-  # ---- probe: which suite actually carries the packages? ------------------
-  # Asked over plain HTTPS, so a broken apt configuration cannot produce a
-  # false negative, and the index we get is reused by route 3.
-  ms_base=""; ms_idx=""; ms_suite=""; ms_relver=""; ms_tried=" "
-  if (( ! ms_done )); then
-    ms_probe="$(mktemp)"
-    for pair in "${OS_VER}:${OS_CODE}" "25.10:questing" "24.04:noble" "22.04:jammy"; do
-      p_ver="${pair%%:*}"; p_suite="${pair##*:}"
-      [[ -z "$p_ver" || -z "$p_suite" ]] && continue
-      [[ "$ms_tried" == *" ${p_ver}/${p_suite} "* ]] && continue
-      ms_tried+="${p_ver}/${p_suite} "
-      printf '    %-16s ' "${p_ver}/${p_suite}"
-      if ! curl -fsSL --max-time 60 -o "$ms_probe" \
-           "https://packages.microsoft.com/ubuntu/${p_ver}/prod/dists/${p_suite}/main/binary-${ARCH}/Packages" 2>/dev/null; then
-        echo "no package index"; continue
-      fi
-      ms_t="$(grep -c '^Package: mssql-tools18$' "$ms_probe")"
-      ms_o="$(grep -c '^Package: msodbcsql18$'  "$ms_probe")"
-      echo "mssql-tools18=${ms_t} msodbcsql18=${ms_o}"
-      (( ms_t > 0 && ms_o > 0 )) || continue
-      ms_relver="$p_ver"; ms_suite="$p_suite"
-      ms_base="https://packages.microsoft.com/ubuntu/${p_ver}/prod"
-      ms_idx="$(mktemp)"; cp "$ms_probe" "$ms_idx"
-      break
-    done
-    rm -f "$ms_probe"
-    [[ -n "$ms_base" && "$ms_relver" != "$OS_VER" ]] && \
-      warn "Microsoft has no Ubuntu ${OS_VER} build — using the ${ms_relver} (${ms_suite}) packages"
-  fi
-
-  # ---- route 2: our own source for that suite -----------------------------
-  if (( ! ms_done )) && [[ -n "$ms_base" ]]; then
-    if fetch_keys /etc/apt/keyrings/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft.asc \
-         https://packages.microsoft.com/keys/microsoft-2025.asc; then
-      if add_repo /etc/apt/sources.list.d/mssql-release.sources \
-           "$ms_base" "$ms_suite" main /etc/apt/keyrings/microsoft.asc; then
-        # A repo for another release must not become a general-purpose source:
-        # noble/prod alone carries ~100 packages (powershell, moby, kubectl)
-        # built for the wrong Ubuntu. Pin the whole suite out of reach and let
-        # only the two SQL packages back through.
-        if [[ "$ms_suite" != "$OS_CODE" ]]; then
-          tee /etc/apt/preferences.d/mssql-release.pref >/dev/null <<EOF
-${MANAGED}
-Package: *
-Pin: release n=${ms_suite}
-Pin-Priority: 1
-
-Package: msodbcsql18 mssql-tools18
-Pin: release n=${ms_suite}
-Pin-Priority: 500
-EOF
-          sub "pinned: only msodbcsql18/mssql-tools18 may come from ${ms_suite}"
-        fi
-        apt-get update -qq 2>&1 | grep -E '^E:' | sed 's/^/    /'
-        if apt_installable mssql-tools18; then
-          sub "candidate $(apt_cand mssql-tools18) from ${ms_relver}/${ms_suite}"
-          ms_apt_install mssql-tools18 && ms_done=1
-        else
-          warn "the ${ms_suite} source produced no installable candidate — removing it again"
-          rm -f /etc/apt/sources.list.d/mssql-release.sources \
-                     /etc/apt/preferences.d/mssql-release.pref
-          apt-get update -qq >/dev/null 2>&1 || true
-        fi
-      fi
-    else
-      warn "could not download the Microsoft signing keys"
-    fi
-  fi
-
-  # ---- route 3: the .deb files straight from the pool ---------------------
-  if (( ! ms_done && ! ms_have )) && [[ -n "$ms_base" ]]; then
-    warn "repo route did not work — installing the .deb files from the pool"
-    ms_pool_install "$ms_base" "$ms_idx" && ms_done=1
-  fi
-  [[ -n "$ms_idx" ]] && rm -f "$ms_idx"
-
-  # ---- last resort: go-sqlcmd --------------------------------------------
-  if (( ! ms_done && ! ms_have )); then
-    [[ -n "$ms_base" ]] || warn "no Microsoft repo carries mssql-tools18 for ${ARCH}"
-    warn "falling back to go-sqlcmd (static binary: sqlcmd only — no bcp, no ODBC driver)"
-    if curl -fsSL --max-time 300 \
-         "https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-${ARCH}.tar.bz2" \
-         | tar xj -C "$BIN" sqlcmd 2>/dev/null; then
-      sub "installed $BIN/sqlcmd"
-      note_fail "mssql-tools18 (go-sqlcmd installed instead)"
-    else
-      warn "that failed too — this machine has no sqlcmd"
-      note_fail "mssql-tools18"
-    fi
-  fi
-
-
-  # /opt/mssql-tools18/bin is on no one's PATH by default; rc.sh appends it when
-  # the directory exists, so a login shell picks it up from the next start.
-  # Checked by what it prints rather than by its exit status: `sqlcmd -?` is a
-  # usage screen, and usage screens are not required to exit 0.
-  if [[ -x "$MS_BIN/sqlcmd" ]]; then
-    ms_v="$("$MS_BIN/sqlcmd" -? 2>&1 | awk '/Version/{print $2; exit}')"
-    if [[ -n "$ms_v" ]]; then
-      sub "sqlcmd ${ms_v} — ${MS_BIN}/sqlcmd (on PATH from the next login shell)"
-    else
-      warn "sqlcmd is installed at ${MS_BIN}/sqlcmd but did not report a version"
-    fi
-  fi
+  log "Microsoft SQL tooling (go-sqlcmd)"
+  gh_bin microsoft/go-sqlcmd "sqlcmd-linux-${ARCH}\.tar\.bz2$" sqlcmd
 fi
 
 
@@ -867,12 +871,9 @@ fi
 # The three things a box with an SSH port deserves, kept deliberately modest:
 #   unattended-upgrades   security updates install themselves
 #   fail2ban              bans an IP after repeated failed SSH logins
-#   ufw                   deny incoming by default; SSH (and mosh) open from
-#                         everywhere, everything open from DEV_UFW_TRUST
-# DEV_UFW_TRUST is empty by default, so any other port (an app, a dev server)
-# must be opened on purpose: `sudo ufw allow from <proxy-ip> to any port <p>`.
-# Docker publishes ports through its own iptables chain and bypasses ufw
-# entirely — bind containers to 127.0.0.1 unless they must be reachable.
+#   ufw                   deny incoming by default; open only what the
+#                         firewall questions named, to whom they named it,
+#                         Docker-published ports included (DOCKER-USER)
 if [[ "$SKIP_HARDENING" != "1" ]]; then
   log "Hardening: unattended-upgrades, fail2ban, ufw"
   hard_pkgs=()
@@ -901,7 +902,7 @@ if [[ "$SKIP_HARDENING" != "1" ]]; then
     tee /etc/fail2ban/jail.d/dev-bootstrap-sshd.local >/dev/null <<EOF
 ${MANAGED}
 [DEFAULT]
-ignoreip = 127.0.0.1/8 ::1 ${DEV_UFW_TRUST}
+ignoreip = 127.0.0.1/8 ::1 ${FW_WORK:-}
 bantime  = 1h
 findtime = 10m
 maxretry = 5
@@ -912,54 +913,73 @@ backend = systemd
 EOF
     systemctl enable fail2ban >/dev/null 2>&1 || true
     if systemctl restart fail2ban >/dev/null 2>&1; then
-      sub "fail2ban: sshd jail on, 5 failures in 10 min = 1 h ban (trusted ranges ignored)"
+      sub "fail2ban: sshd jail on, 5 failures in 10 min = 1 h ban (work networks ignored)"
     else
       warn "fail2ban did not start — journalctl -u fail2ban"; note_fail "fail2ban"
     fi
   fi
 
   # ---- ufw -----------------------------------------------------------------
-  # SSH is allowed BEFORE the firewall is enabled, on whatever port sshd is
-  # really listening on, and enabling is skipped if that rule could not be
-  # added. `ufw allow` is idempotent, so a re-run only reports existing rules.
-  if have ufw; then
+  # The rules are the firewall questions' answers. Every rule this script owns
+  # is removed and the plan added again, so a dropped answer closes its port;
+  # rules with any other comment (added by hand) are never touched. Owned are
+  # the "dev-bootstrap ..." rules, and what earlier versions and the one-off
+  # lockdown of vellox-srv10 (2026-11) added: ssh, mosh, trusted ranges, ...
+  # For the few seconds in between there is no SSH rule: open sessions survive
+  # (conntrack), new ones wait. If an SSH rule cannot be added, SSH is opened
+  # from everywhere rather than locking anyone out.
+  if have ufw && (( FW_READY )); then
     ssh_ports="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ')"
-    [[ -z "$ssh_ports" ]] && ssh_ports="22 "
-    ufw_ok=1
-    for p in $ssh_ports; do
-      ufw allow "${p}/tcp" comment 'ssh' >/dev/null 2>&1 || ufw_ok=0
-    done
-    have mosh && ufw allow 60000:61000/udp comment 'mosh' >/dev/null 2>&1
-    for net in $DEV_UFW_TRUST; do
-      ufw allow from "$net" comment 'trusted (dev-bootstrap)' >/dev/null 2>&1 \
-        || warn "ufw: could not add the trusted range ${net}"
-    done
-    # Drop trusted ranges an earlier run added that DEV_UFW_TRUST no longer
-    # lists (older versions trusted all of RFC 1918 by default).
-    for net in $(ufw show added 2>/dev/null \
-                 | awk '/^ufw allow from .*trusted \(dev-bootstrap\)/{print $4}' | sort -u); do
-      [[ " $DEV_UFW_TRUST " == *" $net "* ]] && continue
-      if ufw delete allow from "$net" >/dev/null 2>&1; then
-        sub "ufw: removed the old trusted range ${net}"
+    [[ -z "${ssh_ports// /}" ]] && ssh_ports="22"
+    fw_mosh=0; have mosh && fw_mosh=1
+    fw_plan_txt="$(fw_plan "$ssh_ports" "$fw_mosh")"
+    owned_re="comment '(dev-bootstrap[^']*|ssh|mosh|trusted \(dev-bootstrap\)|vellox dev\+prod|nginx proxy \(web\)|veeam)'\$"
+    fw_removed=0
+    while IFS= read -r line; do
+      spec="${line#ufw }"; spec="${spec% comment *}"
+      # shellcheck disable=SC2086  # the spec is ufw's own words, split on purpose
+      if ufw --force delete $spec >/dev/null 2>&1; then fw_removed=$((fw_removed+1))
+      else warn "ufw: could not remove: ${spec}"; fi
+    done < <(ufw show added 2>/dev/null | grep -E '^ufw ' | grep -E "$owned_re")
+    ufw_ok=1; fw_added=0
+    while read -r src proto ports role; do
+      [[ -z "$src" ]] && continue
+      if ufw allow from "$src" to any port "$ports" proto "$proto" comment "dev-bootstrap $role" >/dev/null 2>&1; then
+        fw_added=$((fw_added+1))
       else
-        warn "ufw: could not remove the old trusted range ${net}"
+        warn "ufw: could not add ${role}: from ${src} port ${ports}/${proto}"
+        [[ "$role" == ssh ]] && ufw_ok=0
       fi
-    done
-    if (( ufw_ok )); then
-      if ufw status 2>/dev/null | grep -q '^Status: active'; then
-        sub "ufw: already active — rules refreshed (ssh ${ssh_ports}tcp, trusted: ${DEV_UFW_TRUST:-none})"
-      else
-        ufw default deny incoming  >/dev/null 2>&1
-        ufw default allow outgoing >/dev/null 2>&1
-        if ufw --force enable >/dev/null 2>&1; then
-          sub "ufw: enabled — incoming denied except ssh (${ssh_ports}tcp), trusted: ${DEV_UFW_TRUST:-none}"
-        else
-          warn "ufw could not be enabled"; note_fail "ufw"
-        fi
-      fi
-    else
-      warn "ufw: the ssh rule could not be added — NOT enabling the firewall"; note_fail "ufw"
+    done <<<"$fw_plan_txt"
+    if (( ! ufw_ok )); then
+      for p in $ssh_ports; do
+        ufw allow "${p}/tcp" comment 'dev-bootstrap ssh fallback' >/dev/null 2>&1
+      done
+      warn "ufw: an SSH rule failed — SSH is open from everywhere until a re-run succeeds"; note_fail "ufw"
     fi
+    sub "ufw: ${fw_added} rules from the answers (${fw_removed} old ones removed)"
+    # Docker-published ports: the same plan in DOCKER-USER, replacing our block
+    # (and the srv10 lockdown's) on every run.
+    for v in 4 6; do
+      f=/etc/ufw/after.rules; [[ "$v" == 6 ]] && f=/etc/ufw/after6.rules
+      [[ -f "$f" ]] || continue
+      sed -i -e '/^# BEGIN dev-bootstrap$/,/^# END dev-bootstrap$/d' \
+             -e '/^# BEGIN vellox-hardening$/,/^# END vellox-hardening$/d' "$f"
+      fw_docker_block "$v" "$fw_plan_txt" >> "$f"
+    done
+    ufw default deny incoming  >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+      if ufw reload >/dev/null 2>&1; then sub "ufw: reloaded — Docker-published ports follow the same answers"
+      else warn "ufw reload failed — sudo ufw reload"; note_fail "ufw"; fi
+    elif ufw --force enable >/dev/null 2>&1; then
+      sub "ufw: enabled — incoming denied except the answers above"
+    else
+      warn "ufw could not be enabled"; note_fail "ufw"
+    fi
+  elif have ufw; then
+    warn "ufw: left as it is — no firewall answers (run with a terminal, or set DEV_FW_WORK)"
+    note_fail "firewall"
   fi
 fi
 
@@ -1057,11 +1077,7 @@ ver npm      "$(npm --version 2>/dev/null)"
 ver python3  "$(python3 --version 2>/dev/null | awk '{print $2}')"
 ver dotnet   "$(dotnet --list-sdks 2>/dev/null | awk '{print $1}' | tail -1)"
 ver psql     "$(psql --version 2>/dev/null | awk '{print $3}')"
-# sqlcmd is either the mssql-tools18 build or the go-sqlcmd fallback binary.
-sqlcmd_ver="$(/opt/mssql-tools18/bin/sqlcmd -? 2>&1 | awk '/Version/{print $2; exit}')"
-[[ -z "$sqlcmd_ver" && -x "$BIN/sqlcmd" ]] && \
-  sqlcmd_ver="$("$BIN/sqlcmd" --version 2>/dev/null | awk '{print $NF; exit}') (go-sqlcmd)"
-ver sqlcmd   "$sqlcmd_ver"
+ver sqlcmd   "$(sqlcmd --version 2>/dev/null | awk '/Version/{print $2; exit}')"
 ver nano     "$(nano --version 2>/dev/null | head -1 | awk '{print $NF}')"
 ver micro    "$(micro -version 2>/dev/null | awk -F': ' '/Version/{print $2}')"
 ver eza      "$(eza --version 2>/dev/null | awk '/^v/{print $1; exit}')"

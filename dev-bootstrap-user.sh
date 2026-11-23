@@ -469,15 +469,13 @@ if [[ "$SKIP_PYTHON" != "1" ]]; then
       pipx upgrade "$pkg" >/dev/null 2>&1 || pipx install "$pkg" >/dev/null 2>&1 \
         || { warn "pipx: $pkg failed"; note_fail "pipx:$pkg"; }
     done
-    # harlequin: a TUI SQL IDE. The postgres adapter comes as an extra, the
-    # SQL Server one (through the msodbcsql18 driver) as a separate package.
+    # harlequin: a TUI SQL IDE, with the postgres adapter as an extra.
     if pipx list --short 2>/dev/null | grep -q '^harlequin '; then
       pipx upgrade harlequin >/dev/null 2>&1 || true
     else
       pipx install 'harlequin[postgres]' >/dev/null 2>&1 \
         || { warn "pipx: harlequin failed"; note_fail "pipx:harlequin"; }
     fi
-    have harlequin && pipx inject harlequin harlequin-odbc >/dev/null 2>&1 || true
   fi
 fi
 
@@ -1026,7 +1024,6 @@ __path_dedupe() {
   PATH="$out"
 }
 __path_prepend "$HOME/.local/bin"
-[ -d /opt/mssql-tools18/bin ] && __path_append /opt/mssql-tools18/bin
 # .NET: global tools (dotnet-ef, csharp-ls, ...) always; ~/.dotnet only when it
 # holds a private SDK. DOTNET_ROOT is set ONLY in that case — pointing it at
 # ~/.dotnet while dotnet came from apt (/usr/lib/dotnet) breaks every command.
@@ -1236,7 +1233,7 @@ command -v lazygit >/dev/null 2>&1 && alias lg='lazygit'
 # with it. Set up in ~/.gitconfig by the bootstrap; these are just reminders.
 
 # ---- databases --------------------------------------------------------------
-# sqlcmd 18 defaults to encrypted connections; -C trusts self-signed dev certs.
+# sqlcmd defaults to encrypted connections; -C trusts self-signed dev certs.
 alias sqlcmd='sqlcmd -C'
 alias pg='pgcli'
 alias pgl='psql -l'
@@ -2412,18 +2409,13 @@ for b in lazygit starship atuin watchexec difft yazi ya trip onefetch jless croc
   mine="$HOME/.local/bin/$b"
   [[ -f "$mine" && ! -L "$mine" ]] || continue
   sys=""
-  for d in /usr/local/bin /usr/bin /opt/mssql-tools18/bin; do
+  for d in /usr/local/bin /usr/bin; do
     [[ -x "$d/$b" ]] && { sys="$d/$b"; break; }
   done
   [[ -n "$sys" ]] || continue
-  if [[ "$b" == sqlcmd ]]; then
-    # go-sqlcmd fallback vs. the real mssql-tools18: different products, versions do not compare.
-    [[ "$sys" == /opt/* ]] || continue
-  else
-    mv_="$("$mine" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
-    sv_="$("$sys"  --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
-    [[ -n "$mv_" && -n "$sv_" ]] && dpkg --compare-versions "$sv_" ge "$mv_" || continue
-  fi
+  mv_="$("$mine" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+  sv_="$("$sys"  --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+  [[ -n "$mv_" && -n "$sv_" ]] && dpkg --compare-versions "$sv_" ge "$mv_" || continue
   rm -f "$mine"; sub "removed ~/.local/bin/$b — $sys is at least as new"; left_n=$((left_n+1))
 done
 (( left_n == 0 )) && sub "nothing left over"
